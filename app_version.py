@@ -1,2 +1,2 @@
 APP_NAME = "KI-Dienstplan"
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.8"
