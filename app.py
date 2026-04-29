@@ -3,13 +3,14 @@ import bz2
 import hashlib
 from pathlib import Path
 
-SOURCE_SHA256 = "85c61351af6eeb88996a9d2b68c5f7e1e3c0ad93809d7e27373ca53abf9c9330"
-PAYLOAD_PREFIX_LENGTH = 39989
+SOURCE_SHA256 = "46dfa6242f468a2ce9282373cbb3baea0fe636dfdaf92ffedf9774bbba1245e8"
+PAYLOAD_PARTS = ['app_payload_00.b64', 'app_payload_01.b64', 'app_payload_02.b64', 'app_payload_03.b64', 'app_payload_04.b64', 'app_payload_05.b64', 'app_payload_06.b64', 'app_payload_07.b64', 'app_payload_08.b64', 'app_payload_09.b64', 'app_payload_10.b64', 'app_payload_11.b64', 'app_payload_12.b64']
 
 base_dir = Path(__file__).resolve().parent
-payload_prefix = "".join((base_dir / "app_payload.b64").read_text(encoding="ascii").split())[:PAYLOAD_PREFIX_LENGTH]
-payload_tail = "".join((base_dir / "app_payload_tail.b64").read_text(encoding="ascii").split())
-payload = payload_prefix + payload_tail
+payload = "".join(
+    "".join((base_dir / name).read_text(encoding="ascii").split())
+    for name in PAYLOAD_PARTS
+)
 
 source_bytes = bz2.decompress(base64.b64decode(payload, validate=True))
 if hashlib.sha256(source_bytes).hexdigest() != SOURCE_SHA256:
