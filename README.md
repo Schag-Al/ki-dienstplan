@@ -1,11 +1,13 @@
 # KI-Dienstplan
 
-Online-Demo fuer einen einfachen Dienstplan im Browser.
+Online-Demo für einen Dienstplan im Browser.
+
+Aktuelle Version: 0.1.27
 
 ## Start auf Streamlit Community Cloud
 
-- Repository auswaehlen
+- Repository auswählen
 - Branch: `main`
 - Main file path: `app.py`
 
-Die benoetigten Pakete stehen in `requirements.txt`.
+Die benötigten Pakete stehen in `requirements.txt`.
