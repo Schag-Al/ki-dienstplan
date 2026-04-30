@@ -1,0 +1,14 @@
+# Local/runtime data
+__pycache__/
+*.pyc
+.venv/
+.build-venv/
+build/
+dist/
+*.spec
+*.zip
+local-streamlit-*.txt
+streamlit-*.png
+best_plan_cache.json
+saved_schedules.json
+update_config.json
