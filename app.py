@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import calendar
 import copy
@@ -7,7 +7,7 @@ import html
 import json
 import re
 from dataclasses import dataclass
-from datetime import date, time as dt_time, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -87,7 +87,14 @@ DEFAULT_SHIFT_PRIORITY_LABEL = "1 - muss immer besetzt werden"
 PLAN_OPTIMIZATION_MODES = ["Zufriedenheit zuerst", "Ausgewogen", "Abdeckung zuerst"]
 DEFAULT_PLAN_OPTIMIZATION_MODE = "Zufriedenheit zuerst"
 DEFAULT_CALCULATION_MODE = "Aktuelle Berechnung"
-CACHE_ALGORITHM_VERSION = "bestplan-cache-2026-04-29-9-monatsabwesenheiten"
+CACHE_ALGORITHM_VERSION = "bestplan-cache-2026-04-30-zeitkonto-prioritaet"
+PAUSE_POLICY_OPTIONS = [
+    "Pause bezahlt und in Dienstzeit enthalten",
+    "Pause unbezahlt und von Dienstzeit abziehen",
+]
+DEFAULT_PAUSE_POLICY = PAUSE_POLICY_OPTIONS[0]
+DEFAULT_PAUSE_THRESHOLD_HOURS = 6.0
+DEFAULT_PAUSE_DURATION_MINUTES = 30
 REPLACEMENT_REST_SCOPE_OPTIONS = [
     "Keine Ersatzruhe",
     "Nur Feiertage",
@@ -95,6 +102,24 @@ REPLACEMENT_REST_SCOPE_OPTIONS = [
     "Samstage, Sonntage und Feiertage",
 ]
 DEFAULT_REPLACEMENT_REST_SCOPE = "Nur Feiertage"
+REPLACEMENT_REST_KIND_OPTIONS = [
+    "Gesetzliche Ersatzruhe",
+    "Vertraglicher Zeitausgleich",
+]
+DEFAULT_REPLACEMENT_REST_KIND = "Vertraglicher Zeitausgleich"
+NIGHT_CREDIT_MODE_OPTIONS = [
+    "Keine Nachtgutschrift",
+    "Nachtgutschrift ins Zeitkonto",
+    "Nachtgutschrift als Dienststunden",
+]
+DEFAULT_NIGHT_CREDIT_MODE = "Nachtgutschrift ins Zeitkonto"
+DEFAULT_NIGHT_CREDIT_HOURS = 2.0
+TIME_ACCOUNT_USAGE_OPTIONS = [
+    "Vorrangig abbauen (sobald möglich)",
+    "Sobald passend abbauen",
+    "Nachrangig abbauen (nur bei genug Kapazität)",
+]
+DEFAULT_TIME_ACCOUNT_USAGE = "Sobald passend abbauen"
 VACATION_WEEKEND_POLICY_OPTIONS = [
     "Nur eingetragene Urlaubstage",
     "Wochenende nach Urlaub",
@@ -102,8 +127,17 @@ VACATION_WEEKEND_POLICY_OPTIONS = [
 ]
 DEFAULT_VACATION_WEEKEND_POLICY = "Wochenende nach Urlaub"
 DEFAULT_ANNUAL_VACATION_WEEKS = 5.0
+DEFAULT_ANNUAL_VACATION_WORKDAYS = 25.0
+DEFAULT_VACATION_DAY_HOURS = 0.0
 DEFAULT_VACATION_START_DATE = date(2026, 1, 1)
 DEFAULT_FULL_TIME_WEEKLY_HOURS = 40.0
+LEGAL_PROFILE_OPTIONS = [
+    "AZG allgemein",
+    "Schichtbetrieb Österreich",
+    "KA-AZG / Krankenanstalt",
+    "KV/Betriebsvereinbarung",
+]
+DEFAULT_LEGAL_PROFILE = "Schichtbetrieb Österreich"
 TAKEOVER_PREVIOUS_SERVICE_OPTIONS = ["Frei", "Tagdienst", "Nachtdienst"]
 SAVED_SCHEDULES_FILE = Path(__file__).with_name("saved_schedules.json")
 BEST_PLAN_CACHE_FILE = Path(__file__).with_name("best_plan_cache.json")
@@ -133,6 +167,8 @@ class Employee:
     vacation_days: tuple[int, ...] = ()
     annual_vacation_weeks: float = DEFAULT_ANNUAL_VACATION_WEEKS
     vacation_start_date: str = DEFAULT_VACATION_START_DATE.isoformat()
+    annual_vacation_workdays: float = DEFAULT_ANNUAL_VACATION_WORKDAYS
+    vacation_day_hours: float = DEFAULT_VACATION_DAY_HOURS
     prefers_joint_weekends: bool = True
     joint_weekend_priority: int = 3
     participates_in_schedule: bool = True
@@ -242,6 +278,69 @@ def normalize_replacement_rest_scope(value: object, enabled: bool = True) -> str
     return scope
 
 
+def normalize_replacement_rest_kind(value: object) -> str:
+    text = str(value or "").strip()
+    legacy = {
+        "Ersatzruhe": "Gesetzliche Ersatzruhe",
+        "Freizeitausgleich": "Vertraglicher Zeitausgleich",
+        "Ausgleich": "Vertraglicher Zeitausgleich",
+    }
+    text = legacy.get(text, text)
+    return text if text in REPLACEMENT_REST_KIND_OPTIONS else DEFAULT_REPLACEMENT_REST_KIND
+
+
+def normalize_night_credit_mode(value: object) -> str:
+    text = str(value or "").strip()
+    legacy = {
+        "Aus": "Keine Nachtgutschrift",
+        "Keine": "Keine Nachtgutschrift",
+        "Zeitkonto": "Nachtgutschrift ins Zeitkonto",
+        "Dienststunden": "Nachtgutschrift als Dienststunden",
+    }
+    text = legacy.get(text, text)
+    return text if text in NIGHT_CREDIT_MODE_OPTIONS else DEFAULT_NIGHT_CREDIT_MODE
+
+
+def normalize_time_account_usage(value: object) -> str:
+    text = str(value or "").strip()
+    legacy = {
+        "Vorrangig": "Vorrangig abbauen (sobald möglich)",
+        "Vorrangig abbauen": "Vorrangig abbauen (sobald möglich)",
+        "Sofort": "Vorrangig abbauen (sobald möglich)",
+        "Sobald möglich": "Vorrangig abbauen (sobald möglich)",
+        "Normal": "Sobald passend abbauen",
+        "Passend": "Sobald passend abbauen",
+        "Nachrang": "Nachrangig abbauen (nur bei genug Kapazität)",
+        "Nachrangig": "Nachrangig abbauen (nur bei genug Kapazität)",
+        "Nachrangig abbauen": "Nachrangig abbauen (nur bei genug Kapazität)",
+    }
+    text = legacy.get(text, text)
+    return text if text in TIME_ACCOUNT_USAGE_OPTIONS else DEFAULT_TIME_ACCOUNT_USAGE
+
+
+def time_account_usage_weight(value: object) -> tuple[int, int]:
+    usage = normalize_time_account_usage(value)
+    if usage == "Vorrangig abbauen (sobald möglich)":
+        return 900, 260
+    if usage == "Nachrangig abbauen (nur bei genug Kapazität)":
+        return 170, 45
+    return 520, 130
+
+
+def normalize_pause_policy(value: object) -> str:
+    text = str(value or "").strip()
+    legacy = {
+        "Brutto": "Pause bezahlt und in Dienstzeit enthalten",
+        "bezahlt": "Pause bezahlt und in Dienstzeit enthalten",
+        "inkludiert": "Pause bezahlt und in Dienstzeit enthalten",
+        "Netto": "Pause unbezahlt und von Dienstzeit abziehen",
+        "unbezahlt": "Pause unbezahlt und von Dienstzeit abziehen",
+        "abziehen": "Pause unbezahlt und von Dienstzeit abziehen",
+    }
+    text = legacy.get(text, text)
+    return text if text in PAUSE_POLICY_OPTIONS else DEFAULT_PAUSE_POLICY
+
+
 def replacement_rest_applies(
     current_day: date,
     holidays: dict[date, str],
@@ -277,10 +376,16 @@ def normalize_vacation_weekend_policy(value: object) -> str:
 
 
 def vacation_daily_minutes(employee: Employee) -> int:
-    return int(round(float(employee.weekly_hours_target) * 60 / 5))
+    day_hours = float(employee.vacation_day_hours or 0)
+    if day_hours <= 0:
+        day_hours = float(employee.weekly_hours_target) / 5
+    return int(round(day_hours * 60))
 
 
 def vacation_entitlement_hours(employee: Employee) -> float:
+    annual_workdays = float(employee.annual_vacation_workdays or 0)
+    if annual_workdays > 0:
+        return round(annual_workdays * format_minutes_as_hours(vacation_daily_minutes(employee)), 2)
     return round(float(employee.weekly_hours_target) * float(employee.annual_vacation_weeks), 2)
 
 
@@ -637,6 +742,49 @@ def shift_hours(shift_df: pd.DataFrame) -> dict[str, float]:
     }
 
 
+def effective_shift_minutes_by_pause_policy(
+    raw_shift_minutes_by_code: dict[str, int],
+    pause_policy: object,
+    pause_threshold_hours: object,
+    pause_duration_minutes: object,
+) -> dict[str, int]:
+    policy = normalize_pause_policy(pause_policy)
+    if policy != "Pause unbezahlt und von Dienstzeit abziehen":
+        return dict(raw_shift_minutes_by_code)
+    try:
+        threshold_minutes = int(round(max(0.0, float(pause_threshold_hours)) * 60))
+    except (TypeError, ValueError):
+        threshold_minutes = int(round(DEFAULT_PAUSE_THRESHOLD_HOURS * 60))
+    try:
+        pause_minutes = int(round(max(0.0, float(pause_duration_minutes))))
+    except (TypeError, ValueError):
+        pause_minutes = int(DEFAULT_PAUSE_DURATION_MINUTES)
+    if pause_minutes <= 0:
+        return dict(raw_shift_minutes_by_code)
+    return {
+        code: max(0, int(minutes) - pause_minutes) if int(minutes) >= threshold_minutes else int(minutes)
+        for code, minutes in raw_shift_minutes_by_code.items()
+    }
+
+
+def pause_policy_description(
+    pause_policy: object,
+    pause_threshold_hours: object,
+    pause_duration_minutes: object,
+) -> str:
+    policy = normalize_pause_policy(pause_policy)
+    if policy == "Pause unbezahlt und von Dienstzeit abziehen":
+        try:
+            duration_minutes = int(round(float(pause_duration_minutes)))
+        except (TypeError, ValueError):
+            duration_minutes = DEFAULT_PAUSE_DURATION_MINUTES
+        return (
+            f"{policy}, ab {format_display_hours(pause_threshold_hours)} h "
+            f"{duration_minutes} min"
+        )
+    return policy
+
+
 def parse_shift_time_range(value: object) -> tuple[int, int] | None:
     match = re.search(r"(\d{1,2})\s*-\s*(\d{1,2})", str(value or ""))
     if not match:
@@ -674,6 +822,122 @@ def has_required_rest_between(
     next_start, _next_end = next_window
     rest_minutes = (24 * 60 + next_start) - previous_end
     return rest_minutes >= required_hours * 60
+
+
+def legal_profile_defaults(profile: object) -> dict[str, object]:
+    normalized = str(profile or DEFAULT_LEGAL_PROFILE).strip()
+    if normalized not in LEGAL_PROFILE_OPTIONS:
+        normalized = DEFAULT_LEGAL_PROFILE
+    defaults = {
+        "legal_profile": normalized,
+        "daily_max_hours": 12.0,
+        "weekly_average_max_hours": 48.0,
+        "weekly_average_period_weeks": 17,
+        "weekly_rest_hours": 36.0,
+        "reduced_weekly_rest_hours": 24.0,
+        "allow_reduced_weekly_rest": False,
+        "pause_after_hours": DEFAULT_PAUSE_THRESHOLD_HOURS,
+        "pause_minutes": DEFAULT_PAUSE_DURATION_MINUTES,
+    }
+    if normalized == "Schichtbetrieb Österreich":
+        defaults["allow_reduced_weekly_rest"] = True
+    elif normalized == "KA-AZG / Krankenanstalt":
+        defaults["daily_max_hours"] = 13.0
+        defaults["allow_reduced_weekly_rest"] = True
+    elif normalized == "KV/Betriebsvereinbarung":
+        defaults["allow_reduced_weekly_rest"] = True
+        defaults["weekly_average_period_weeks"] = 26
+    return defaults
+
+
+def normalize_legal_profile(value: object) -> str:
+    text = str(value or DEFAULT_LEGAL_PROFILE).strip()
+    legacy = {
+        "Schicht": "Schichtbetrieb Österreich",
+        "KA-AZG": "KA-AZG / Krankenanstalt",
+        "Krankenanstalt": "KA-AZG / Krankenanstalt",
+        "KV": "KV/Betriebsvereinbarung",
+    }
+    text = legacy.get(text, text)
+    return text if text in LEGAL_PROFILE_OPTIONS else DEFAULT_LEGAL_PROFILE
+
+
+def rest_minutes_over_free_day(
+    previous_shift: str,
+    next_shift: str,
+    shift_time_by_code: dict[str, tuple[int, int]],
+) -> int | None:
+    previous_window = shift_time_by_code.get(previous_shift)
+    next_window = shift_time_by_code.get(next_shift)
+    if previous_window is None or next_window is None:
+        return None
+    _previous_start, previous_end = previous_window
+    next_start, _next_end = next_window
+    return (2 * 24 * 60 + next_start) - previous_end
+
+
+def assignment_work_intervals(
+    assignments: list[str],
+    days: list[date],
+    shift_time_by_code: dict[str, tuple[int, int]],
+    *,
+    previous_assignments: list[str] | None = None,
+) -> list[tuple[datetime, datetime]]:
+    intervals: list[tuple[datetime, datetime]] = []
+    previous_assignments = previous_assignments or []
+    if days:
+        first_day = days[0]
+        for offset, assignment in enumerate(reversed(previous_assignments[-21:]), start=1):
+            shift = first_real_shift(assignment)
+            window = shift_time_by_code.get(shift)
+            if window is None:
+                continue
+            start_minutes, end_minutes = window
+            work_day = first_day - timedelta(days=offset)
+            start_dt = datetime.combine(work_day, dt_time()) + timedelta(minutes=start_minutes)
+            end_dt = datetime.combine(work_day, dt_time()) + timedelta(minutes=end_minutes)
+            intervals.append((start_dt, end_dt))
+    for day_index, assignment in enumerate(assignments):
+        if day_index >= len(days):
+            continue
+        shift = first_real_shift(assignment)
+        window = shift_time_by_code.get(shift)
+        if window is None:
+            continue
+        start_minutes, end_minutes = window
+        start_dt = datetime.combine(days[day_index], dt_time()) + timedelta(minutes=start_minutes)
+        end_dt = datetime.combine(days[day_index], dt_time()) + timedelta(minutes=end_minutes)
+        intervals.append((start_dt, end_dt))
+    return sorted(intervals)
+
+
+def max_free_minutes_in_window(
+    intervals: list[tuple[datetime, datetime]],
+    window_start: datetime,
+    window_end: datetime,
+) -> int:
+    relevant = sorted(
+        (
+            max(start, window_start),
+            min(end, window_end),
+        )
+        for start, end in intervals
+        if end > window_start and start < window_end
+    )
+    cursor = window_start
+    max_gap = 0
+    for start, end in relevant:
+        if start > cursor:
+            max_gap = max(max_gap, int((start - cursor).total_seconds() // 60))
+        if end > cursor:
+            cursor = end
+    if cursor < window_end:
+        max_gap = max(max_gap, int((window_end - cursor).total_seconds() // 60))
+    return max_gap
+
+
+def iso_week_start(current_day: date) -> date:
+    return current_day - timedelta(days=current_day.weekday())
 
 def default_resource_dataframe() -> pd.DataFrame:
     return pd.DataFrame(
@@ -822,10 +1086,26 @@ def plan_month_key(year: int, month: int) -> str:
 def month_sequence_number(year: int, month: int) -> int:
     return int(year) * 12 + int(month)
 
+
+def shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
+    position = month_sequence_number(year, month) - 1 + int(delta)
+    return position // 12, position % 12 + 1
+
+
 def previous_plan_month_key(year: int, month: int) -> str:
     if month == 1:
         return plan_month_key(year - 1, 12)
     return plan_month_key(year, month - 1)
+
+
+def next_open_plan_month(saved_plans: dict, start_year: int, start_month: int) -> tuple[int, int]:
+    year = int(start_year)
+    month = int(start_month)
+    guard = 0
+    while plan_month_key(year, month) in (saved_plans or {}) and guard < 180:
+        year, month = shift_month(year, month, 1)
+        guard += 1
+    return year, month
 
 
 def can_generate_month(
@@ -1503,6 +1783,8 @@ def display_employee_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         "Wochenstunden",
         "Max. Wochenstunden",
         "Urlaubswochen/Jahr",
+        "Urlaubstage/Jahr",
+        "Urlaubstag h",
         "Übernahme Resturlaub h",
         "Übernahme Zeitkonto h",
         "Übernahme Ersatzruhe h",
@@ -1620,6 +1902,11 @@ def germanize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         "Urlaub-Rest h",
         "Start-Zeitkonto h",
         "Zeitkonto nach Plan h",
+        "Zusatz h",
+        "Monats +/- aktuell h",
+        "Monats +/- nach Einsatz h",
+        "Zeitkonto gesamt aktuell h",
+        "Zeitkonto gesamt nach Einsatz h",
         "Start-Ersatzruhe h",
     }
     for column in display_df.columns:
@@ -1653,6 +1940,13 @@ def solve_schedule(
     vacation_weekend_policy: str = DEFAULT_VACATION_WEEKEND_POLICY,
     shift_time_by_code: dict[str, tuple[int, int]] | None = None,
     block_night_before_wish_free: bool = True,
+    daily_max_work_hours: float = 12.0,
+    weekly_rest_hours: float = 36.0,
+    reduced_weekly_rest_hours: float = 24.0,
+    allow_reduced_weekly_rest: bool = True,
+    night_credit_mode: str = DEFAULT_NIGHT_CREDIT_MODE,
+    night_credit_hours: float = DEFAULT_NIGHT_CREDIT_HOURS,
+    time_account_usage: str = DEFAULT_TIME_ACCOUNT_USAGE,
     plan_strategy: str = DEFAULT_PLAN_OPTIMIZATION_MODE,
     max_time_seconds: int = 120,
     optimize_for_fairness: bool = True,
@@ -1677,6 +1971,10 @@ def solve_schedule(
     replacement_rest_scope = normalize_replacement_rest_scope(replacement_rest_scope)
     vacation_weekend_policy = normalize_vacation_weekend_policy(vacation_weekend_policy)
     plan_strategy = str(plan_strategy or DEFAULT_PLAN_OPTIMIZATION_MODE).strip()
+    daily_max_minutes = int(round(max(1.0, float(daily_max_work_hours)) * 60))
+    weekly_rest_minutes = int(round(max(1.0, float(weekly_rest_hours)) * 60))
+    reduced_weekly_rest_minutes = int(round(max(1.0, float(reduced_weekly_rest_hours)) * 60))
+    hard_weekly_rest_minutes = reduced_weekly_rest_minutes if allow_reduced_weekly_rest else weekly_rest_minutes
     if plan_strategy not in {
         *PLAN_OPTIMIZATION_MODES,
         "Wochenenden schützen",
@@ -1690,6 +1988,9 @@ def solve_schedule(
     }:
         plan_strategy = normalize_plan_optimization_mode(plan_strategy)
     profile = optimization_profile(plan_strategy)
+    night_credit_mode = normalize_night_credit_mode(night_credit_mode)
+    night_credit_minutes = int(round(max(0.0, float(night_credit_hours)) * 60))
+    time_account_weight, time_account_positive_weight = time_account_usage_weight(time_account_usage)
     objective_terms = []
     coverage_objective_terms = []
     shortage_penalty_terms = []
@@ -1777,6 +2078,11 @@ def solve_schedule(
             sum(x[(e, d, shift)] for d in range(day_count) for shift in night_shifts)
             <= employee.max_nights_per_month
         )
+
+        for d in range(day_count):
+            for shift in shifts:
+                if shift_minutes_by_code.get(shift, 8 * 60) > daily_max_minutes:
+                    model.Add(x[(e, d, shift)] == 0)
 
         if not employee.allow_three_consecutive_nights:
             for d in range(day_count - 2):
@@ -1886,6 +2192,12 @@ def solve_schedule(
                 )
                 <= max_weekly_minutes
             )
+            if len(week_days) >= 2:
+                required_free_days = 1 if hard_weekly_rest_minutes <= 24 * 60 else 2
+                model.Add(
+                    sum(x[(e, d, shift)] for d in week_days for shift in shifts)
+                    <= max(0, len(week_days) - required_free_days)
+                )
 
         max_workdays = max(1, min(day_count, employee.max_consecutive_workdays))
         for start_day in range(0, day_count - max_workdays):
@@ -1980,6 +2292,7 @@ def solve_schedule(
         wish_free_priority = priority_weight(employee.wish_free_priority)
         employee_satisfaction_loss_terms = satisfaction_loss_terms_by_employee[e]
         vacation_minutes = vacation_paid_minutes_for_month(employee, days, vacation_counts_as_hours)
+        employee_night_shifts = sum(x[(e, d, shift)] for d in range(day_count) for shift in night_shifts)
         total_minutes = vacation_minutes + sum(
             x[(e, d, shift)] * shift_minutes_by_code.get(shift, 8 * 60)
             for d in range(day_count)
@@ -1991,8 +2304,9 @@ def solve_schedule(
                 for d, current_day in enumerate(days)
                 if replacement_rest_applies(current_day, holidays, replacement_rest_scope)
                 for shift in shifts
-        )
-        employee_night_shifts = sum(x[(e, d, shift)] for d in range(day_count) for shift in night_shifts)
+            )
+        if night_credit_mode == "Nachtgutschrift als Dienststunden" and night_credit_minutes > 0:
+            total_minutes += employee_night_shifts * night_credit_minutes
         weekend_shifts = sum(x[(e, d, shift)] for d in weekend_days for shift in shifts)
         weekend_block_vars = []
         for saturday_index, sunday_index in weekend_pairs:
@@ -2050,6 +2364,23 @@ def solve_schedule(
         abs_hours = model.NewIntVar(0, max_hour_deviation_minutes, f"abs_hours_e{e}")
         model.AddMaxEquality(abs_hours, [over_hours, under_hours])
         hour_deviations.append(abs_hours)
+        start_balance_minutes = int(round(float(employee.takeover_time_balance_hours or 0) * 60))
+        if start_balance_minutes:
+            balance_bound = max(
+                1,
+                max_hour_deviation_minutes + abs(start_balance_minutes) + day_count * night_credit_minutes,
+            )
+            final_time_balance = model.NewIntVar(-balance_bound, balance_bound, f"final_time_balance_e{e}")
+            final_time_balance_expr = start_balance_minutes + total_minutes - target_minutes
+            if night_credit_mode == "Nachtgutschrift ins Zeitkonto" and night_credit_minutes > 0:
+                final_time_balance_expr += employee_night_shifts * night_credit_minutes
+            model.Add(final_time_balance == final_time_balance_expr)
+            final_time_balance_abs = model.NewIntVar(0, balance_bound, f"final_time_balance_abs_e{e}")
+            model.AddAbsEquality(final_time_balance_abs, final_time_balance)
+            positive_time_balance = model.NewIntVar(0, balance_bound, f"positive_time_balance_e{e}")
+            model.AddMaxEquality(positive_time_balance, [final_time_balance, model.NewConstant(0)])
+            objective_terms.append(final_time_balance_abs * -time_account_weight)
+            objective_terms.append(positive_time_balance * -time_account_positive_weight)
         hour_weight_percent = profile["hour_weight_percent"]
         objective_terms.extend(
             [
@@ -2585,6 +2916,41 @@ def add_compensatory_rest_days(
     return updated_schedule, updated_metrics, open_notes
 
 
+def apply_night_credit_hours(
+    schedule: dict,
+    metrics: dict,
+    night_shifts: list[str],
+    credit_hours_per_night: float,
+    counts_as_hours: bool,
+) -> dict:
+    if credit_hours_per_night <= 0 or not night_shifts:
+        return metrics
+    night_set = set(night_shifts)
+    updated_metrics = {name: dict(values) for name, values in metrics.items()}
+    for employee_name, assignments in (schedule or {}).items():
+        if employee_name not in updated_metrics:
+            continue
+        night_count = sum(1 for assignment in assignments if first_real_shift(assignment) in night_set)
+        credit_hours = round(night_count * float(credit_hours_per_night), 2)
+        values = updated_metrics[employee_name]
+        base_hours = float(values.get("Geplante Stunden vor Nachtgutschrift", values.get("Geplante Stunden", 0)) or 0)
+        values["Geplante Stunden vor Nachtgutschrift"] = round(base_hours, 2)
+        values["Nachtgutschrift h"] = credit_hours
+        if counts_as_hours:
+            target_hours = float(values.get("Sollstunden", 0) or 0)
+            corrected_hours = round(base_hours + credit_hours, 2)
+            values["Geplante Stunden"] = corrected_hours
+            values["Plus/Minus Stunden"] = round(corrected_hours - target_hours, 2)
+            values["Stundenabweichung h"] = round(abs(corrected_hours - target_hours), 2)
+            start_time_balance = float(values.get("Start-Zeitkonto h", 0) or 0)
+            values["Zeitkonto nach Plan h"] = round(start_time_balance + corrected_hours - target_hours, 2)
+        else:
+            start_time_balance = float(values.get("Start-Zeitkonto h", 0) or 0)
+            current_balance = float(values.get("Plus/Minus Stunden", 0) or 0)
+            values["Zeitkonto nach Plan h"] = round(start_time_balance + current_balance + credit_hours, 2)
+    return updated_metrics
+
+
 def open_services_dataframe(
     schedule: dict,
     days: list[date],
@@ -2628,6 +2994,331 @@ def open_services_dataframe(
     return pd.DataFrame(rows)
 
 
+def replacement_shift_options(
+    schedule: dict,
+    day_index: int,
+    daily_requirements: dict[tuple[int, str], int],
+    shift_df: pd.DataFrame,
+    shifts: list[str],
+) -> list[tuple[str, str]]:
+    cleaned_shifts = shift_definitions_from_editor(shift_df)
+    shift_names = {str(row["Kuerzel"]): str(row["Name"]) for _, row in cleaned_shifts.iterrows()}
+    options = []
+    for shift in shifts:
+        demand = int(daily_requirements.get((day_index, shift), 0) or 0)
+        assigned = sum(
+            1
+            for assignments in schedule.values()
+            if day_index < len(assignments) and first_real_shift(assignments[day_index]) == shift
+        )
+        if demand > 0 or assigned > 0:
+            label = f"{shift} - {shift_names.get(shift, shift)} ({assigned}/{demand} besetzt)"
+            options.append((shift, label))
+    if not options:
+        options = [(shift, f"{shift} - {shift_names.get(shift, shift)}") for shift in shifts]
+    return options
+
+
+def assignment_display_state(value: object) -> str:
+    text = str(value or "-").strip()
+    if not text or text == "-":
+        return "frei"
+    return text
+
+
+def simulated_work_run(assignments: list[str], day_index: int, target_shift: str) -> list[str]:
+    simulated = [first_real_shift(value) for value in assignments]
+    if 0 <= day_index < len(simulated):
+        simulated[day_index] = target_shift
+    return simulated
+
+
+def longest_work_streak(real_assignments: list[str], previous_assignments: list[str] | None = None) -> int:
+    combined = [first_real_shift(value) for value in (previous_assignments or [])[-14:]] + list(real_assignments)
+    longest = 0
+    current = 0
+    for shift in combined:
+        if shift != "-":
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def week_indices_for_day(days: list[date], day_index: int) -> list[int]:
+    if day_index >= len(days):
+        return []
+    iso_key = (days[day_index].isocalendar().year, days[day_index].isocalendar().week)
+    return [
+        index
+        for index, current_day in enumerate(days)
+        if (current_day.isocalendar().year, current_day.isocalendar().week) == iso_key
+    ]
+
+
+def replacement_extra_hours(
+    target_shift: str,
+    shift_minutes_by_code: dict[str, int],
+    night_shifts: list[str],
+    night_credit_mode: str,
+    night_credit_hours: float,
+) -> tuple[float, float]:
+    base_hours = format_minutes_as_hours(shift_minutes_by_code.get(target_shift, 8 * 60))
+    credit_hours = (
+        max(0.0, float(night_credit_hours))
+        if target_shift in set(night_shifts) and normalize_night_credit_mode(night_credit_mode) != "Keine Nachtgutschrift"
+        else 0.0
+    )
+    month_extra = base_hours + (
+        credit_hours if normalize_night_credit_mode(night_credit_mode) == "Nachtgutschrift als Dienststunden" else 0.0
+    )
+    time_account_extra = base_hours + credit_hours
+    return round(month_extra, 2), round(time_account_extra, 2)
+
+
+def replacement_candidate_dataframe(
+    schedule: dict,
+    metrics: dict,
+    employees: list[Employee],
+    days: list[date],
+    day_index: int,
+    target_shift: str,
+    shifts: list[str],
+    night_shifts: list[str],
+    shift_minutes_by_code: dict[str, int],
+    shift_time_by_code: dict[str, tuple[int, int]],
+    previous_assignments: dict[str, list[str]] | None,
+    *,
+    vacation_weekend_policy: str,
+    block_night_before_wish_free: bool,
+    daily_max_work_hours: float,
+    max_overtime_percent: float,
+    max_overtime_hours: float,
+    night_credit_mode: str,
+    night_credit_hours: float,
+) -> tuple[pd.DataFrame, int]:
+    previous_assignments = previous_assignments or {}
+    night_set = set(night_shifts)
+    day_shift_set = set(shifts) - night_set
+    rows = []
+    hidden_count = 0
+    target_minutes = shift_minutes_by_code.get(target_shift, 8 * 60)
+    month_extra_hours, time_account_extra_hours = replacement_extra_hours(
+        target_shift,
+        shift_minutes_by_code,
+        night_shifts,
+        night_credit_mode,
+        night_credit_hours,
+    )
+
+    for employee in employees:
+        if not employee.participates_in_schedule:
+            hidden_count += 1
+            continue
+        assignments = list(schedule.get(employee.name, ["-"] * len(days)))
+        if len(assignments) < len(days):
+            assignments = assignments + ["-"] * (len(days) - len(assignments))
+        current_assignment = assignments[day_index] if day_index < len(assignments) else "-"
+        current_shift = first_real_shift(current_assignment)
+        hard_reasons: list[str] = []
+        notes: list[str] = []
+        score = 1000.0
+
+        if current_shift == target_shift:
+            hidden_count += 1
+            continue
+        if current_shift != "-":
+            hard_reasons.append(f"hat bereits {current_shift}")
+        if day_index in employee.planned_sick_days:
+            hard_reasons.append("geplanter Krankenstand")
+        vacation_protected = vacation_protected_day_indices(employee, days, vacation_weekend_policy)
+        if day_index in vacation_protected:
+            hard_reasons.append("Urlaub oder geschütztes Urlaubswochenende")
+        if target_minutes > int(round(float(daily_max_work_hours) * 60)):
+            hard_reasons.append("Dienst überschreitet Tageshöchstgrenze")
+
+        previous_row = previous_assignments.get(employee.name, [])
+        previous_shift = "-"
+        if day_index > 0:
+            previous_shift = first_real_shift(assignments[day_index - 1])
+        elif previous_row:
+            previous_shift = first_real_shift(previous_row[-1])
+        next_shift = first_real_shift(assignments[day_index + 1]) if day_index + 1 < len(assignments) else "-"
+        second_previous_shift = "-"
+        if day_index > 1:
+            second_previous_shift = first_real_shift(assignments[day_index - 2])
+        elif day_index == 1 and previous_row:
+            second_previous_shift = first_real_shift(previous_row[-1])
+        elif day_index == 0 and len(previous_row) >= 2:
+            second_previous_shift = first_real_shift(previous_row[-2])
+
+        if previous_shift != "-" and not has_required_rest_between(previous_shift, target_shift, shift_time_by_code):
+            hard_reasons.append("zu wenig Ruhezeit zum Vortag")
+        if next_shift != "-" and not has_required_rest_between(target_shift, next_shift, shift_time_by_code):
+            hard_reasons.append("zu wenig Ruhezeit zum Folgetag")
+        if previous_shift in night_set and target_shift in day_shift_set:
+            hard_reasons.append("Tagdienst direkt nach Nachtdienst")
+        if target_shift in night_set and next_shift in day_shift_set:
+            hard_reasons.append("Tagdienst direkt nach neuer Nacht")
+
+        if (
+            employee.rest_after_night >= 2
+            and employee.rest_priority == 1
+            and previous_shift in night_set
+            and target_shift not in night_set
+        ):
+            hard_reasons.append("Ausschlaftag nach Nachtdienst")
+        if (
+            employee.rest_after_night >= 2
+            and employee.rest_priority == 1
+            and second_previous_shift in night_set
+            and previous_shift not in night_set
+            and target_shift not in night_set
+        ):
+            hard_reasons.append("zweiter freier Tag nach Nachtdienst")
+        if (
+            target_shift in night_set
+            and employee.rest_after_night >= 2
+            and employee.rest_priority == 1
+            and next_shift not in {"-", *night_set}
+        ):
+            hard_reasons.append("Folgetag nach neuer Nacht ist besetzt")
+        if (
+            target_shift in night_set
+            and employee.rest_after_night >= 2
+            and employee.rest_priority == 1
+            and next_shift not in night_set
+            and day_index + 2 < len(assignments)
+            and first_real_shift(assignments[day_index + 2]) != "-"
+        ):
+            hard_reasons.append("zweiter Folgetag nach neuer Nacht ist besetzt")
+        if (
+            block_night_before_wish_free
+            and target_shift in night_set
+            and day_index + 1 < len(days)
+            and (day_index + 1) in employee.blocked_days
+            and employee.wish_free_priority == 1
+        ):
+            hard_reasons.append("Nacht vor Wunschfrei Prio 1")
+
+        simulated = simulated_work_run(assignments, day_index, target_shift)
+        if longest_work_streak(simulated, previous_row) > employee.max_consecutive_workdays:
+            hard_reasons.append("max. Tage in Folge überschritten")
+
+        week_indices = week_indices_for_day(days, day_index)
+        week_shift_count = sum(1 for index in week_indices if first_real_shift(assignments[index]) != "-") + 1
+        if week_shift_count > employee.max_shifts_per_week:
+            hard_reasons.append("max. Dienste/Woche überschritten")
+        week_minutes = sum(
+            shift_minutes_by_code.get(first_real_shift(assignments[index]), 0)
+            for index in week_indices
+            if first_real_shift(assignments[index]) != "-"
+        ) + target_minutes
+        if week_minutes > int(round(float(employee.max_weekly_planned_hours) * 60)):
+            hard_reasons.append("max. Wochenstunden überschritten")
+
+        current_nights = sum(1 for value in assignments if first_real_shift(value) in night_set)
+        if target_shift in night_set:
+            if current_nights + 1 > employee.max_nights_per_month:
+                hard_reasons.append("max. Nächte/Monat überschritten")
+            if not employee.allow_three_consecutive_nights:
+                for start_index in range(max(0, day_index - 2), min(len(simulated) - 2, day_index) + 1):
+                    if all(simulated[check_index] in night_set for check_index in range(start_index, start_index + 3)):
+                        hard_reasons.append("3 Nächte in Folge nicht erlaubt")
+                        break
+
+        employee_metrics = metrics.get(employee.name, {})
+        target_hours = float(employee_metrics.get("Sollstunden", 0) or 0)
+        monthly_balance = float(employee_metrics.get("Plus/Minus Stunden", 0) or 0)
+        start_balance = float(employee_metrics.get("Start-Zeitkonto h", 0) or 0)
+        total_balance = float(employee_metrics.get("Zeitkonto nach Plan h", start_balance + monthly_balance) or 0)
+        satisfaction = float(employee_metrics.get("Zufriedenheit %", 0) or 0)
+        month_after = monthly_balance + month_extra_hours
+        total_after = total_balance + time_account_extra_hours
+        overtime_limit = format_minutes_as_hours(
+            allowed_variance_minutes(round(target_hours * 60), max_overtime_percent, max_overtime_hours)
+        )
+        if overtime_limit > 0 and month_after > overtime_limit + 0.01:
+            hard_reasons.append("Überstunden-Grenze würde überschritten")
+
+        if hard_reasons:
+            hidden_count += 1
+            continue
+
+        if day_index in employee.blocked_days:
+            notes.append(f"Wunschfrei Prio {employee.wish_free_priority}")
+            score -= {1: 420, 2: 300, 3: 180}.get(employee.wish_free_priority, 90)
+        current_text = str(current_assignment or "-")
+        if "ER" in current_text:
+            notes.append("Ausgleich/Ersatzruhe eingetragen")
+            score -= 260
+        if target_shift in night_set:
+            if employee.likes_nights:
+                notes.append("übernimmt gerne Nächte")
+                score += 90
+            else:
+                notes.append("möchte Nächte eher vermeiden")
+                score -= {1: 360, 2: 260, 3: 160}.get(employee.night_priority, 80)
+            if employee.double_nights_only:
+                adjacent_night = previous_shift in night_set or next_shift in night_set
+                if adjacent_night:
+                    score += 60
+                    notes.append("passt zu Doppelnacht")
+                else:
+                    score -= 120
+                    notes.append("wäre einzelne Nacht")
+        if days[day_index].weekday() >= 5 and employee.prefers_weekends_off:
+            notes.append(f"Wochenende eher frei Prio {employee.weekend_priority}")
+            score -= {1: 260, 2: 190, 3: 120}.get(employee.weekend_priority, 60)
+
+        if abs(total_after) < abs(total_balance):
+            score += min(140, abs(total_balance) * 4)
+            notes.append("verbessert das Zeitkonto")
+        else:
+            score -= min(220, max(0.0, total_after) * 3)
+        if satisfaction < 75:
+            notes.append("Zufriedenheit bereits niedrig")
+            score -= (75 - satisfaction) * 6
+        elif satisfaction >= 90:
+            score += 40
+        score -= max(0.0, month_after) * 2
+        score += max(0.0, -monthly_balance) * 1.5
+
+        if score >= 850 and not any("Wunschfrei" in note or "Ersatzruhe" in note for note in notes):
+            suitability = "1. sehr geeignet"
+        elif score >= 650:
+            suitability = "2. geeignet"
+        else:
+            suitability = "3. nur mit Konflikt"
+
+        rows.append(
+            {
+                "Rangwert": round(score, 2),
+                "Einschätzung": suitability,
+                "MitarbeiterIn": employee.name,
+                "Aktuell am Tag": assignment_display_state(current_assignment),
+                "Regelcheck": "möglich" if suitability != "3. nur mit Konflikt" else "möglich, aber bewusst prüfen",
+                "Begründung": "; ".join(notes) if notes else "frei, keine direkten Konflikte erkannt",
+                "Zusatz h": month_extra_hours,
+                "Monats +/- aktuell h": monthly_balance,
+                "Monats +/- nach Einsatz h": round(month_after, 2),
+                "Zeitkonto gesamt aktuell h": total_balance,
+                "Zeitkonto gesamt nach Einsatz h": round(total_after, 2),
+                "Zufriedenheit aktuell": f"{format_display_hours(satisfaction)} %",
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(), hidden_count
+    result = pd.DataFrame(rows).sort_values(
+        by=["Rangwert", "Zeitkonto gesamt nach Einsatz h"],
+        ascending=[False, True],
+    )
+    result.insert(0, "Rang", range(1, len(result) + 1))
+    return result.drop(columns=["Rangwert"]), hidden_count
+
+
 def schedule_shortage_penalty(
     schedule: dict,
     days: list[date],
@@ -2658,6 +3349,139 @@ def schedule_shortage_penalty(
     return penalty
 
 
+def weekly_rest_findings(
+    schedule: dict,
+    employees: list[Employee],
+    days: list[date],
+    shift_time_by_code: dict[str, tuple[int, int]],
+    previous_assignments: dict[str, list[str]] | None,
+    weekly_rest_hours: float,
+    reduced_weekly_rest_hours: float,
+    allow_reduced_weekly_rest: bool,
+) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not days:
+        return errors, warnings
+    previous_assignments = previous_assignments or {}
+    week_starts = sorted({iso_week_start(day) for day in days})
+    target_minutes = int(round(float(weekly_rest_hours) * 60))
+    reduced_minutes = int(round(float(reduced_weekly_rest_hours) * 60))
+    for employee in employees:
+        assignments = list(schedule.get(employee.name, []))
+        intervals = assignment_work_intervals(
+            assignments,
+            days,
+            shift_time_by_code,
+            previous_assignments=previous_assignments.get(employee.name, []),
+        )
+        weekly_gaps: list[int] = []
+        for week_start_day in week_starts:
+            window_start = datetime.combine(week_start_day, dt_time())
+            window_end = window_start + timedelta(days=7)
+            max_gap = max_free_minutes_in_window(intervals, window_start, window_end)
+            weekly_gaps.append(max_gap)
+            if max_gap >= target_minutes:
+                continue
+            label = f"{employee.name}: KW {week_start_day.isocalendar().week} ({format_display_hours(format_minutes_as_hours(max_gap))} h)"
+            if allow_reduced_weekly_rest and max_gap >= reduced_minutes:
+                warnings.append(label + " verkürzte Wochenruhe")
+            else:
+                errors.append(label)
+        if allow_reduced_weekly_rest and len(weekly_gaps) >= 4:
+            for start_index in range(0, len(weekly_gaps) - 3):
+                average_gap = sum(weekly_gaps[start_index:start_index + 4]) / 4
+                if average_gap < target_minutes:
+                    week_label = week_starts[start_index].isocalendar().week
+                    errors.append(
+                        f"{employee.name}: 4-Wochen-Schnitt ab KW {week_label} nur "
+                        f"{format_display_hours(format_minutes_as_hours(round(average_gap)))} h Wochenruhe"
+                    )
+                    break
+    return errors, warnings
+
+
+def rolling_weekly_hours_findings(
+    schedule: dict,
+    employees: list[Employee],
+    days: list[date],
+    shift_minutes_by_code: dict[str, int],
+    saved_schedules: dict | None,
+    weekly_average_max_hours: float,
+    weekly_average_period_weeks: int,
+) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not days:
+        return errors, warnings
+    saved_schedules = saved_schedules or {}
+    employee_names = {employee.name for employee in employees}
+    current_weeks = sorted({(day.isocalendar().year, day.isocalendar().week) for day in days})
+    weekly_minutes: dict[str, dict[tuple[int, int], int]] = {name: {} for name in employee_names}
+
+    def add_month_schedule(month_schedule: dict, month_days: list[date]) -> None:
+        if not isinstance(month_schedule, dict):
+            return
+        for employee_name, assignments in month_schedule.items():
+            if employee_name not in weekly_minutes or not isinstance(assignments, list):
+                continue
+            for day_index, assignment in enumerate(assignments):
+                if day_index >= len(month_days):
+                    continue
+                shift = first_real_shift(assignment)
+                if shift == "-":
+                    continue
+                week_key = (month_days[day_index].isocalendar().year, month_days[day_index].isocalendar().week)
+                weekly_minutes[employee_name][week_key] = (
+                    weekly_minutes[employee_name].get(week_key, 0)
+                    + shift_minutes_by_code.get(shift, 8 * 60)
+                )
+
+    for key, plan in sorted(saved_schedules.items()):
+        if not isinstance(plan, dict) or not re.fullmatch(r"\d{4}-\d{2}", str(key)):
+            continue
+        year_text, month_text = str(key).split("-")
+        month_days = build_month_dates(int(year_text), int(month_text))
+        if not month_days:
+            continue
+        if month_days[-1] >= days[0] - timedelta(weeks=max(1, weekly_average_period_weeks)):
+            add_month_schedule(plan.get("schedule", {}), month_days)
+    add_month_schedule(schedule, days)
+
+    for employee in employees:
+        employee_weeks = weekly_minutes.get(employee.name, {})
+        known_weeks = set(employee_weeks)
+        for current_week in current_weeks:
+            week_start = date.fromisocalendar(current_week[0], current_week[1], 1)
+            for offset in range(max(1, weekly_average_period_weeks)):
+                check_day = week_start - timedelta(weeks=offset)
+                iso = check_day.isocalendar()
+                known_weeks.add((iso.year, iso.week))
+        if len(employee_weeks) < max(1, weekly_average_period_weeks) and current_weeks:
+            warnings.append(
+                f"{employee.name}: Durchrechnung nur mit {len(employee_weeks)} von {weekly_average_period_weeks} Wochen Daten prüfbar"
+            )
+        for current_week in current_weeks:
+            week_start = date.fromisocalendar(current_week[0], current_week[1], 1)
+            window_keys = []
+            for offset in range(max(1, weekly_average_period_weeks)):
+                check_day = week_start - timedelta(weeks=offset)
+                iso = check_day.isocalendar()
+                window_keys.append((iso.year, iso.week))
+            if not window_keys:
+                continue
+            average_hours = format_minutes_as_hours(
+                round(sum(employee_weeks.get(key, 0) for key in window_keys) / len(window_keys))
+            )
+            if average_hours > float(weekly_average_max_hours) + 0.01:
+                errors.append(
+                    f"{employee.name}: Ø {format_display_hours(average_hours)} h/Woche "
+                    f"über {len(window_keys)} Woche(n)"
+                )
+                break
+    return errors, warnings
+
+
 def validate_schedule_rules(
     schedule: dict,
     metrics: dict,
@@ -2679,6 +3503,14 @@ def validate_schedule_rules(
     open_shift_codes: list[str] | None = None,
     shift_priority_by_code: dict[str, int] | None = None,
     vacation_weekend_policy: str = DEFAULT_VACATION_WEEKEND_POLICY,
+    legal_profile: str = DEFAULT_LEGAL_PROFILE,
+    daily_max_work_hours: float = 12.0,
+    weekly_average_max_hours: float = 48.0,
+    weekly_average_period_weeks: int = 17,
+    weekly_rest_hours: float = 36.0,
+    reduced_weekly_rest_hours: float = 24.0,
+    allow_reduced_weekly_rest: bool = True,
+    saved_schedules: dict | None = None,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     previous_assignments = previous_assignments or {}
@@ -2706,6 +3538,7 @@ def validate_schedule_rules(
     rest_after_night_errors = []
     hour_errors = []
     vacation_errors = []
+    daily_limit_errors = []
 
     for employee_name, assignments in schedule.items():
         employee = employee_by_name.get(employee_name)
@@ -2749,6 +3582,11 @@ def validate_schedule_rules(
                 sick_errors.append(f"{employee_name}: {day_label(days[day_index])}")
             if day_index in vacation_protected_day_indices(employee, days, vacation_weekend_policy):
                 vacation_errors.append(f"{employee_name}: {day_label(days[day_index])}")
+            if shift_minutes_by_code.get(shift, 8 * 60) > int(round(float(daily_max_work_hours) * 60)):
+                daily_limit_errors.append(
+                    f"{employee_name}: {day_label(days[day_index])} {shift} "
+                    f"({format_display_hours(format_minutes_as_hours(shift_minutes_by_code.get(shift, 0)))} h)"
+                )
             if day_index < len(real_assignments) - 1:
                 next_shift = real_assignments[day_index + 1]
                 if next_shift != "-" and not has_required_rest_between(shift, next_shift, shift_time_by_code):
@@ -2810,6 +3648,59 @@ def validate_schedule_rules(
     add("Freie Tage nach Nachtdienst", "OK" if not rest_after_night_errors else "Fehler", details(rest_after_night_errors))
     add("Max. 2 Nächte in Folge", "OK" if not three_night_errors else "Fehler", details(three_night_errors))
     add("Plus-/Minusstunden-Grenzen", "OK" if not hour_errors else "Fehler", details(hour_errors))
+    add("Tageshöchstarbeitszeit", "OK" if not daily_limit_errors else "Fehler", details(daily_limit_errors))
+
+    weekly_rest_errors, weekly_rest_warnings = weekly_rest_findings(
+        schedule,
+        employees,
+        days,
+        shift_time_by_code,
+        previous_assignments,
+        weekly_rest_hours,
+        reduced_weekly_rest_hours,
+        allow_reduced_weekly_rest,
+    )
+    if weekly_rest_errors:
+        add("Wochenruhe", "Fehler", details(weekly_rest_errors), "Dienste so ändern, dass je Woche eine ausreichend lange Ruhephase entsteht.")
+    elif weekly_rest_warnings:
+        add(
+            "Wochenruhe",
+            "Hinweis",
+            details(weekly_rest_warnings),
+            "Bei Schichtarbeit prüfen, ob die verkürzte Wochenruhe im 4-Wochen-Schnitt ausgeglichen ist.",
+        )
+    else:
+        add("Wochenruhe", "OK", f"{format_display_hours(weekly_rest_hours)} h Wochenruhe werden eingehalten.")
+
+    rolling_errors, rolling_warnings = rolling_weekly_hours_findings(
+        schedule,
+        employees,
+        days,
+        shift_minutes_by_code,
+        saved_schedules,
+        weekly_average_max_hours,
+        weekly_average_period_weeks,
+    )
+    if rolling_errors:
+        add(
+            "48h-Durchrechnung",
+            "Fehler",
+            details(rolling_errors),
+            "Wochenstunden senken, Dienste verschieben oder Durchrechnungszeitraum/KV-Regel prüfen.",
+        )
+    elif rolling_warnings:
+        add(
+            "48h-Durchrechnung",
+            "Hinweis",
+            details(rolling_warnings),
+            "Für eine vollständige Prüfung müssen genug fixierte Vormonate vorhanden sein.",
+        )
+    else:
+        add(
+            "48h-Durchrechnung",
+            "OK",
+            f"Ø-Grenze {format_display_hours(weekly_average_max_hours)} h über {weekly_average_period_weeks} Wochen im Profil {legal_profile}.",
+        )
 
     open_services = open_services_dataframe(
         schedule,
@@ -2819,14 +3710,19 @@ def validate_schedule_rules(
         open_shift_codes=open_shift_codes,
         shift_priority_by_code=shift_priority_by_code,
     )
-    if open_services.empty:
-        add("Offene Dienste", "OK", "Alle angeforderten Dienste wurden besetzt.")
+    hard_open_services = (
+        open_services[open_services["Prioritaet"].astype(int) == 1]
+        if not open_services.empty and "Prioritaet" in open_services.columns
+        else pd.DataFrame()
+    )
+    if hard_open_services.empty:
+        add("Offene Pflichtdienste", "OK", "Alle Prio-1-Dienste wurden besetzt.")
     else:
         add(
-            "Offene Dienste",
-            "Hinweis",
-            f"{int(open_services['Offen'].sum())} Dienst(e) bleiben offen.",
-            "Offene Dienste prüfen oder mehr Personal/mehr Überstunden erlauben.",
+            "Offene Pflichtdienste",
+            "Fehler",
+            f"{int(hard_open_services['Offen'].sum())} Prio-1-Dienst(e) bleiben offen.",
+            "Pflichtdienste prüfen, Personal erhöhen oder harte Grenzwerte lockern.",
         )
 
     return rows
@@ -2899,6 +3795,513 @@ def active_warning_value(metrics: dict) -> int:
     if metrics_df.empty or "Aktive Warnungen" not in metrics_df:
         return 0
     return int(pd.to_numeric(metrics_df["Aktive Warnungen"], errors="coerce").fillna(0).sum())
+
+
+def traffic_light_label(level: str) -> str:
+    return {
+        "green": "Grün",
+        "yellow": "Gelb",
+        "red": "Rot",
+        "neutral": "Info",
+    }.get(str(level), "Info")
+
+
+def traffic_light_class(level: str) -> str:
+    return {
+        "green": "#16a34a",
+        "yellow": "#d97706",
+        "red": "#dc2626",
+        "neutral": "#64748b",
+    }.get(str(level), "#64748b")
+
+
+def render_traffic_light_cards(rows: list[dict[str, str]]) -> None:
+    if not rows:
+        return
+    st.markdown(
+        """
+<style>
+.quality-light-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0.75rem; margin: 0.25rem 0 1rem 0; }
+.quality-light-card { border: 1px solid #e5e7eb; border-radius: 8px; background: #ffffff; padding: 0.85rem 0.95rem; min-height: 112px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04); }
+.quality-light-top { display: flex; align-items: center; gap: 0.5rem; font-weight: 700; color: #111827; margin-bottom: 0.35rem; }
+.quality-light-dot { width: 0.75rem; height: 0.75rem; border-radius: 999px; flex: 0 0 auto; }
+.quality-light-status { color: #4b5563; font-size: 0.86rem; margin-bottom: 0.3rem; }
+.quality-light-detail { color: #6b7280; font-size: 0.8rem; line-height: 1.35; }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+    cards = []
+    for row in rows:
+        color = traffic_light_class(str(row.get("level", "neutral")))
+        title = html.escape(str(row.get("title", "")))
+        status = html.escape(str(row.get("status", "")))
+        detail = html.escape(str(row.get("detail", "")))
+        cards.append(
+            f'<div class="quality-light-card">'
+            f'<div class="quality-light-top">'
+            f'<span class="quality-light-dot" style="background:{color}"></span>'
+            f'<span>{title}</span>'
+            f'</div>'
+            f'<div class="quality-light-status">{status}</div>'
+            f'<div class="quality-light-detail">{detail}</div>'
+            f'</div>'
+        )
+    st.markdown('<div class="quality-light-grid">' + "".join(cards) + "</div>", unsafe_allow_html=True)
+
+
+def plan_quality_signal_rows(
+    metrics_df: pd.DataFrame,
+    rule_checks: list[dict[str, str]] | None,
+    open_service_count: int,
+    solver_status: str | None,
+) -> list[dict[str, str]]:
+    rule_checks = rule_checks or []
+    rule_error_count = sum(1 for check in rule_checks if check.get("Status") == "Fehler")
+    rule_hint_count = sum(1 for check in rule_checks if check.get("Status") == "Hinweis")
+    average_satisfaction = (
+        float(pd.to_numeric(metrics_df.get("Zufriedenheit %", pd.Series([0])), errors="coerce").fillna(0).mean() or 0)
+        if not metrics_df.empty
+        else 0.0
+    )
+    minimum_satisfaction = (
+        float(pd.to_numeric(metrics_df.get("Zufriedenheit %", pd.Series([0])), errors="coerce").fillna(0).min() or 0)
+        if not metrics_df.empty
+        else 0.0
+    )
+    active_warnings = (
+        int(pd.to_numeric(metrics_df.get("Aktive Warnungen", pd.Series([0])), errors="coerce").fillna(0).sum())
+        if not metrics_df.empty
+        else 0
+    )
+    rows: list[dict[str, str]] = []
+    if rule_error_count:
+        rows.append(
+            {
+                "level": "red",
+                "title": "Rechtliche Prüfung",
+                "status": f"{rule_error_count} Fehler",
+                "detail": "Plan nicht fixieren. Zuerst die Fehler in der Regelprüfung beheben.",
+            }
+        )
+    elif rule_hint_count:
+        rows.append(
+            {
+                "level": "yellow",
+                "title": "Rechtliche Prüfung",
+                "status": f"OK mit {rule_hint_count} Hinweis(en)",
+                "detail": "Harte Regeln sind erfüllt. Hinweise wie Durchrechnung oder Wochenruhe bewusst prüfen.",
+            }
+        )
+    else:
+        rows.append(
+            {
+                "level": "green",
+                "title": "Rechtliche Prüfung",
+                "status": "OK",
+                "detail": "Keine harten Regelverletzungen gefunden.",
+            }
+        )
+
+    if average_satisfaction >= 90 and minimum_satisfaction >= 70 and active_warnings <= 10:
+        quality_level = "green"
+        quality_status = "sehr gut"
+        quality_detail = "Zufriedenheit und schlechteste Einzelwerte liegen im Zielbereich."
+    elif average_satisfaction >= 80 and minimum_satisfaction >= 55:
+        quality_level = "yellow"
+        quality_status = "brauchbar, aber verbesserbar"
+        quality_detail = "Plan ist verwendbar. Die Handlungsanweisungen zeigen, wo Zufriedenheit verloren geht."
+    else:
+        quality_level = "red"
+        quality_status = "zu niedrig"
+        quality_detail = "Plan nicht vorschnell fixieren. Wünsche, Personalverfügbarkeit oder Bedarf prüfen."
+    rows.append(
+        {
+            "level": quality_level,
+            "title": "Planqualität",
+            "status": f"{format_display_hours(round(average_satisfaction, 1))} % Ø, min. {format_display_hours(round(minimum_satisfaction, 1))} %",
+            "detail": quality_detail if quality_status else "",
+        }
+    )
+
+    if open_service_count == 0:
+        rows.append(
+            {
+                "level": "green",
+                "title": "Abdeckung",
+                "status": "alles besetzt",
+                "detail": "Alle angeforderten Dienste wurden besetzt.",
+            }
+        )
+    elif open_service_count <= 10:
+        rows.append(
+            {
+                "level": "yellow",
+                "title": "Abdeckung",
+                "status": f"{open_service_count} offene Dienste",
+                "detail": "Offene Dienste prüfen. Sie können erlaubt sein, drücken aber die Planqualität.",
+            }
+        )
+    else:
+        rows.append(
+            {
+                "level": "red",
+                "title": "Abdeckung",
+                "status": f"{open_service_count} offene Dienste",
+                "detail": "Viele Dienste bleiben offen. Bedarf, Prioritäten oder Personalbestand prüfen.",
+            }
+        )
+
+    if solver_status == "OPTIMAL":
+        rows.append(
+            {
+                "level": "green",
+                "title": "Beweisgrad",
+                "status": "optimal bewiesen",
+                "detail": "Der Solver hat sein internes Ziel vollständig bewiesen.",
+            }
+        )
+    elif solver_status == "FEASIBLE":
+        rows.append(
+            {
+                "level": "yellow",
+                "title": "Beweisgrad",
+                "status": "gültig, nicht optimal bewiesen",
+                "detail": "Der Plan ist gültig. Weiter optimieren kann noch bessere Varianten finden.",
+            }
+        )
+    else:
+        rows.append(
+            {
+                "level": "red",
+                "title": "Beweisgrad",
+                "status": solver_status_text(solver_status),
+                "detail": solver_status_detail(solver_status),
+            }
+        )
+    return rows
+
+
+def scenario_readiness_dataframe(
+    preflight_df: pd.DataFrame,
+    service_diagnostics_df: pd.DataFrame,
+    staffing_summary: dict[str, float],
+    previous_assignments: dict[str, list[str]],
+    employees: list[Employee],
+    days: list[date],
+    holidays: dict[date, str],
+    vacation_weekend_policy: str,
+) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    blocker_count = int((preflight_df["Status"] == "Blocker").sum()) if not preflight_df.empty else 0
+    service_conflicts = len(service_diagnostics_df) if service_diagnostics_df is not None else 0
+    hard_margin = float(staffing_summary.get("hard_margin_hours", 0) or 0)
+    too_many = float(staffing_summary.get("too_many_personnel_hours", 0) or 0)
+    too_few = float(staffing_summary.get("too_few_personnel_hours", 0) or 0)
+
+    if blocker_count:
+        normal_level = "Rot"
+        normal_result = f"{blocker_count} Blocker"
+        normal_action = "Blocker vor dem Generieren beheben."
+    elif service_conflicts:
+        normal_level = "Gelb"
+        normal_result = f"{service_conflicts} Engpass-Tage"
+        normal_action = "Engpässe je Tag/Dienstform prüfen."
+    else:
+        normal_level = "Grün"
+        normal_result = "keine schnellen Blocker"
+        normal_action = "Generierung ist sinnvoll."
+    rows.append(
+        {
+            "Szenario": "Normalmonat",
+            "Ampel": normal_level,
+            "Was geprüft wird": "Personalstunden, Pflichtdienste, Sperrtage, Nachtkapazität",
+            "Ergebnis": normal_result,
+            "Nächster Schritt": normal_action,
+        }
+    )
+
+    protected_days = 0
+    for employee in employees:
+        protected_days += len(set(employee.blocked_days))
+        protected_days += len(set(employee.planned_sick_days))
+        protected_days += len(vacation_protected_day_indices(employee, days, vacation_weekend_policy))
+    holiday_count = sum(1 for current_day in days if current_day in holidays)
+    weekend_count = sum(1 for current_day in days if current_day.weekday() >= 5)
+    protected_ratio = (
+        protected_days / max(1, len(employees) * len(days))
+        if employees and days
+        else 0
+    )
+    if too_many > 0 or too_few > 0:
+        stress_level = "Rot"
+        stress_result = "Stundenrahmen passt nicht"
+        stress_action = "Sollstunden, Dienstbedarf oder Plus-/Minusstunden-Grenzen anpassen."
+    elif service_conflicts or hard_margin < 0 or protected_ratio >= 0.12 or holiday_count >= 3:
+        stress_level = "Gelb"
+        stress_result = "enger Monat"
+        stress_action = "Vor dem Fixieren offene Dienste und Engpass-Tage prüfen."
+    else:
+        stress_level = "Grün"
+        stress_result = "Stressfaktoren planbar"
+        stress_action = "Generieren und danach Zufriedenheit prüfen."
+    rows.append(
+        {
+            "Szenario": "Engpassmonat",
+            "Ampel": stress_level,
+            "Was geprüft wird": "Feiertage, Wochenenden, Urlaub, Wunschfrei, Krankenstand",
+            "Ergebnis": f"{holiday_count} Feiertag(e), {weekend_count} Samstage/Sonntage, {protected_days} geschützte Personentage",
+            "Nächster Schritt": stress_action,
+        }
+    )
+
+    takeover_people = [name for name, plan in (previous_assignments or {}).items() if plan]
+    if takeover_people:
+        takeover_blockers = (
+            preflight_df[
+                preflight_df.get("Thema", pd.Series(dtype=str)).astype(str).str.contains("Monatsübergang|Übernahme", case=False, na=False)
+            ]
+            if not preflight_df.empty
+            else pd.DataFrame()
+        )
+        takeover_level = "Rot" if not takeover_blockers.empty and (takeover_blockers["Status"] == "Blocker").any() else "Grün"
+        takeover_result = f"{len(takeover_people)} Person(en) mit Vormonat/Übernahmestand"
+        takeover_action = "Monatsübergang wird berücksichtigt." if takeover_level == "Grün" else "Übernahmestand/Vormonat prüfen."
+    else:
+        takeover_level = "Info"
+        takeover_result = "nicht aktiv"
+        takeover_action = "Für Start aus altem System Übernahmestände bestätigen."
+    rows.append(
+        {
+            "Szenario": "Übernahme-/Startmonat",
+            "Ampel": takeover_level,
+            "Was geprüft wird": "Nachtdienst vor Start, Arbeitstage in Folge, Start-Zeitkonto",
+            "Ergebnis": takeover_result,
+            "Nächster Schritt": takeover_action,
+        }
+    )
+    return pd.DataFrame(rows)
+
+
+def legal_guardrail_dataframe(
+    legal_profile: str,
+    daily_max_work_hours: float,
+    weekly_average_max_hours: float,
+    weekly_average_period_weeks: int,
+    weekly_rest_hours: float,
+    reduced_weekly_rest_hours: float,
+    allow_reduced_weekly_rest: bool,
+    replacement_rest_kind: str,
+    replacement_rest_scope: str,
+    vacation_weekend_policy: str,
+    night_credit_mode: str = DEFAULT_NIGHT_CREDIT_MODE,
+    night_credit_hours: float = DEFAULT_NIGHT_CREDIT_HOURS,
+    time_account_usage: str = DEFAULT_TIME_ACCOUNT_USAGE,
+    pause_policy: str = DEFAULT_PAUSE_POLICY,
+    pause_threshold_hours: float = DEFAULT_PAUSE_THRESHOLD_HOURS,
+    pause_duration_minutes: int = DEFAULT_PAUSE_DURATION_MINUTES,
+) -> pd.DataFrame:
+    rest_text = (
+        f"{format_display_hours(reduced_weekly_rest_hours)} h Mindestwert, "
+        f"{format_display_hours(weekly_rest_hours)} h im Schnitt"
+        if allow_reduced_weekly_rest
+        else f"{format_display_hours(weekly_rest_hours)} h"
+    )
+    rows = [
+        {
+            "Leitplanke": "Rechtsprofil",
+            "Aktuelle Einstellung": str(legal_profile),
+            "Wirkt als": "Voreinstellung",
+            "Hinweis für NutzerInnen": "Profil muss zu KV, Betriebsvereinbarung und Berufsgruppe passen.",
+        },
+        {
+            "Leitplanke": "Tageshöchstarbeitszeit",
+            "Aktuelle Einstellung": f"{format_display_hours(daily_max_work_hours)} h",
+            "Wirkt als": "harte Regel",
+            "Hinweis für NutzerInnen": "Dienstformen über dieser Grenze werden nicht eingeplant.",
+        },
+        {
+            "Leitplanke": "Wöchentliche Ruhezeit",
+            "Aktuelle Einstellung": rest_text,
+            "Wirkt als": "harte Regel/Hinweis",
+            "Hinweis für NutzerInnen": "Bei Schichtarbeit sind 24 h nur mit Ausgleich im 4-Wochen-Schnitt sauber.",
+        },
+        {
+            "Leitplanke": "48h-Durchrechnung",
+            "Aktuelle Einstellung": f"{format_display_hours(weekly_average_max_hours)} h über {weekly_average_period_weeks} Wochen",
+            "Wirkt als": "Regelprüfung",
+            "Hinweis für NutzerInnen": "Wird verlässlicher, sobald mehrere Monate fixiert sind.",
+        },
+        {
+            "Leitplanke": "Ruhepause",
+            "Aktuelle Einstellung": pause_policy_description(
+                pause_policy,
+                pause_threshold_hours,
+                pause_duration_minutes,
+            ),
+            "Wirkt als": "Dienststundenberechnung",
+            "Hinweis für NutzerInnen": "Pausenregel muss zu Vertrag, KV und gelebter Dienstform passen.",
+        },
+        {
+            "Leitplanke": "Ersatzruhe/Zeitausgleich",
+            "Aktuelle Einstellung": f"{replacement_rest_kind}, {replacement_rest_scope}",
+            "Wirkt als": "Berechnung und Hinweis",
+            "Hinweis für NutzerInnen": "Feiertags-Zeitausgleich braucht je nach Vertrag/KV eine saubere Grundlage.",
+        },
+        {
+            "Leitplanke": "Nachtgutschrift",
+            "Aktuelle Einstellung": f"{normalize_night_credit_mode(night_credit_mode)}, {format_display_hours(night_credit_hours)} h pro Nachtdienst",
+            "Wirkt als": "Zeitkonto/Berechnung",
+            "Hinweis für NutzerInnen": "Nachtgutschriften sind KV-/vertragsabhängig und hier bewusst einstellbar.",
+        },
+        {
+            "Leitplanke": "Zeitkonto-Ausgleich",
+            "Aktuelle Einstellung": normalize_time_account_usage(time_account_usage),
+            "Wirkt als": "Optimierungsziel",
+            "Hinweis für NutzerInnen": "Steuert, wie stark Plus-/Minusstunden aus dem Start-Zeitkonto in neuen Plänen abgebaut werden.",
+        },
+        {
+            "Leitplanke": "Urlaub",
+            "Aktuelle Einstellung": str(vacation_weekend_policy),
+            "Wirkt als": "harte Abwesenheit",
+            "Hinweis für NutzerInnen": "Urlaub zählt als bezahlte Dienstzeit; Anspruch läuft je Stichtag/Urlaubsjahr.",
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+def planning_workflow_dataframe(
+    employee_count: int,
+    employee_warning_count: int,
+    blocker_count: int,
+    warning_count: int,
+    generated_plan_exists: bool,
+    saved_plan_exists: bool,
+    can_generate: bool,
+) -> pd.DataFrame:
+    rows = []
+    rows.append(
+        {
+            "Schritt": "1. Mitarbeiter & Abwesenheiten",
+            "Status": "prüfen" if employee_warning_count else "OK",
+            "Was bedeutet das?": (
+                f"{employee_count} dienstplanrelevante Personen, {employee_warning_count} Hinweis(e)"
+                if employee_warning_count
+                else f"{employee_count} dienstplanrelevante Personen bereit"
+            ),
+            "Nächster Klick": "Mitarbeiter & Wünsche öffnen" if employee_warning_count else "weiter",
+        }
+    )
+    if blocker_count:
+        setup_status = "Blocker"
+        setup_next = "Blocker in der Machbarkeitsprüfung beheben"
+    elif warning_count:
+        setup_status = "Warnungen"
+        setup_next = "Engpässe ansehen, dann bewusst generieren"
+    else:
+        setup_status = "OK"
+        setup_next = "Dienstplan generieren"
+    rows.append(
+        {
+            "Schritt": "2. Machbarkeit prüfen",
+            "Status": setup_status,
+            "Was bedeutet das?": f"{blocker_count} Blocker, {warning_count} Warnungen",
+            "Nächster Klick": setup_next,
+        }
+    )
+    rows.append(
+        {
+            "Schritt": "3. Dienstplan generieren",
+            "Status": "bereit" if can_generate else "gesperrt",
+            "Was bedeutet das?": "Monat darf geplant werden" if can_generate else "Vormonat fehlt oder Startmonat passt nicht",
+            "Nächster Klick": "Dienstplan generieren" if can_generate and not generated_plan_exists else "Plan prüfen",
+        }
+    )
+    rows.append(
+        {
+            "Schritt": "4. Qualität prüfen",
+            "Status": "Plan vorhanden" if generated_plan_exists else "wartet",
+            "Was bedeutet das?": "Qualitätsampel, Regelprüfung und Ursachen ansehen" if generated_plan_exists else "Noch kein Entwurf vorhanden",
+            "Nächster Klick": "Weiter optimieren oder speichern" if generated_plan_exists else "erst generieren",
+        }
+    )
+    rows.append(
+        {
+            "Schritt": "5. Fixieren",
+            "Status": "fixiert" if saved_plan_exists else "offen",
+            "Was bedeutet das?": "Monat ist gespeichert" if saved_plan_exists else "Plan ist noch nicht verbindlich",
+            "Nächster Klick": "nächsten Monat planen" if saved_plan_exists else "Plan speichern und fixieren",
+        }
+    )
+    return pd.DataFrame(rows)
+
+
+def failure_next_steps_dataframe(
+    preflight_df: pd.DataFrame,
+    service_diagnostics_df: pd.DataFrame,
+    diagnosis_reasons: list[str],
+) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    if preflight_df is not None and not preflight_df.empty:
+        blocker_df = preflight_df[preflight_df["Status"].isin(["Blocker", "Warnung"])]
+        for _, row in blocker_df.head(5).iterrows():
+            rows.append(
+                {
+                    "Priorität": "1" if row.get("Status") == "Blocker" else "2",
+                    "Ursache": str(row.get("Thema", "")),
+                    "Beleg": str(row.get("Hinweis", "")),
+                    "Was tun?": str(row.get("Was tun?", "")),
+                }
+            )
+
+    if service_diagnostics_df is not None and not service_diagnostics_df.empty:
+        reason_counter: dict[str, int] = {}
+        missing_total = int(pd.to_numeric(service_diagnostics_df.get("Fehlt", pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
+        for reason_text in service_diagnostics_df.get("Wichtigste Gründe", pd.Series(dtype=str)).fillna("-"):
+            for part in str(reason_text).split(","):
+                reason = part.split(":")[0].strip()
+                if reason and reason != "-":
+                    reason_counter[reason] = reason_counter.get(reason, 0) + 1
+        main_reason = max(reason_counter.items(), key=lambda item: item[1])[0] if reason_counter else "zu wenige geeignete Personen"
+        action = {
+            "Urlaub": "Urlaubswochen verschieben oder Ersatzpersonal einplanen.",
+            "Krankenstand": "Krankenstand bleibt frei; Bedarf an diesen Tagen senken oder anderes Personal freigeben.",
+            "Wunschfrei Prio 1": "Prio-1-Wunschfrei nur bei wirklich zwingenden Tagen verwenden oder Bedarf senken.",
+            "keine Nächte erlaubt": "Mehr Personen für Nachtdienste freigeben oder Nachtbedarf reduzieren.",
+            "Nachtwunsch sperrt": "Nachtwunsch-Prioritäten prüfen oder Nachtgrenzen geeigneter Personen erhöhen.",
+            "Nach Nacht aus Vormonat": "Vormonat/Übernahmestand prüfen; nach Nacht keinen Tagdienst planen.",
+        }.get(main_reason, "Engpass-Tage öffnen und dort Bedarf, Urlaub, Wunschfrei und Nachtfähigkeit prüfen.")
+        rows.append(
+            {
+                "Priorität": "1",
+                "Ursache": "Konkrete Tages-/Dienstform-Engpässe",
+                "Beleg": f"{len(service_diagnostics_df)} Engpass-Zeilen, {missing_total} fehlende Besetzungen; Hauptgrund: {main_reason}",
+                "Was tun?": action,
+            }
+        )
+
+    for reason in diagnosis_reasons:
+        if reason.startswith("Hauptgrund:"):
+            rows.insert(
+                0,
+                {
+                    "Priorität": "1",
+                    "Ursache": "Hauptgrund",
+                    "Beleg": reason,
+                    "Was tun?": "Diesen Punkt zuerst ändern und danach neu generieren.",
+                },
+            )
+            break
+    if not rows:
+        rows.append(
+            {
+                "Priorität": "1",
+                "Ursache": "Kombination harter Regeln",
+                "Beleg": "Die Schnellprüfung findet keinen einzelnen einfachen Blocker.",
+                "Was tun?": "Dienstbedarf testweise reduzieren oder Regeln schrittweise lockern, um den Konflikt einzugrenzen.",
+            }
+        )
+    return pd.DataFrame(rows).drop_duplicates()
 
 
 def variant_time_budget_seconds(
@@ -3476,11 +4879,20 @@ def build_preflight_checks(
     vacation_weekend_policy: str = DEFAULT_VACATION_WEEKEND_POLICY,
     previous_assignments: dict[str, list[str]] | None = None,
     block_night_before_wish_free: bool = True,
+    legal_profile: str = DEFAULT_LEGAL_PROFILE,
+    daily_max_work_hours: float = 12.0,
+    weekly_average_max_hours: float = 48.0,
+    weekly_average_period_weeks: int = 17,
+    weekly_rest_hours: float = 36.0,
+    reduced_weekly_rest_hours: float = 24.0,
+    allow_reduced_weekly_rest: bool = True,
+    shift_minutes_by_code: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, str]] = []
     open_shift_set = set(open_shift_codes)
     employee_count = len(employees)
     previous_assignments = previous_assignments or {}
+    shift_minutes_by_code = shift_minutes_by_code or {}
 
     def add(status: str, thema: str, hinweis: str, empfehlung: str) -> None:
         rows.append(
@@ -3495,6 +4907,35 @@ def build_preflight_checks(
     if employee_count == 0:
         add("Blocker", "MitarbeiterInnen", "Es sind keine MitarbeiterInnen vorhanden.", "Mindestens eine Person anlegen.")
         return pd.DataFrame(rows)
+
+    add(
+        "OK",
+        "Rechtsprofil",
+        (
+            f"{legal_profile}: Tagesgrenze {format_display_hours(daily_max_work_hours)} h, "
+            f"Wochenruhe {format_display_hours(weekly_rest_hours)} h"
+            + (
+                f" (Schicht-Mindestwert {format_display_hours(reduced_weekly_rest_hours)} h)"
+                if allow_reduced_weekly_rest
+                else ""
+            )
+            + f", 48h-Durchrechnung über {weekly_average_period_weeks} Wochen."
+        ),
+        "KV/Betriebsvereinbarung prüfen und bei Bedarf Profilwerte anpassen.",
+    )
+
+    too_long_shifts = [
+        f"{shift} ({format_display_hours(format_minutes_as_hours(minutes))} h)"
+        for shift, minutes in sorted(shift_minutes_by_code.items())
+        if minutes > int(round(float(daily_max_work_hours) * 60))
+    ]
+    if too_long_shifts:
+        add(
+            "Blocker",
+            "Tageshöchstarbeitszeit",
+            "Diese Dienstformen überschreiten die Tagesgrenze: " + ", ".join(too_long_shifts),
+            "Dienstform kürzen, Profil prüfen oder passende KA-AZG/KV-Regel einstellen.",
+        )
 
     too_many_hours = float(staffing_summary.get("too_many_personnel_hours", 0))
     too_few_hours = float(staffing_summary.get("too_few_personnel_hours", 0))
@@ -4002,6 +5443,8 @@ def editor_dataframe(employees: list[Employee]) -> pd.DataFrame:
                 "Krankenstand je Monat": "",
                 "Urlaub je Monat": "",
                 "Urlaubswochen/Jahr": e.annual_vacation_weeks,
+                "Urlaubstage/Jahr": e.annual_vacation_workdays,
+                "Urlaubstag h": e.vacation_day_hours,
                 "Urlaubs-Stichtag": e.vacation_start_date,
                 "Übernahme bestätigt": e.takeover_confirmed,
                 "Übernahme Startdatum": e.takeover_start_date,
@@ -4047,6 +5490,8 @@ def normalize_employee_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         "Krankenstand je Monat": "",
         "Urlaub je Monat": "",
         "Urlaubswochen/Jahr": DEFAULT_ANNUAL_VACATION_WEEKS,
+        "Urlaubstage/Jahr": DEFAULT_ANNUAL_VACATION_WORKDAYS,
+        "Urlaubstag h": DEFAULT_VACATION_DAY_HOURS,
         "Urlaubs-Stichtag": DEFAULT_VACATION_START_DATE.isoformat(),
         "Übernahme bestätigt": False,
         "Übernahme Startdatum": "",
@@ -4087,6 +5532,12 @@ def normalize_employee_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     )
     normalized["Urlaubs-Stichtag"] = normalized["Urlaubs-Stichtag"].map(
         lambda value: parse_date_value(value, DEFAULT_VACATION_START_DATE).isoformat()
+    )
+    normalized["Urlaubstage/Jahr"] = normalized["Urlaubstage/Jahr"].map(
+        lambda value: max(0.0, parse_hour_value(value, DEFAULT_ANNUAL_VACATION_WORKDAYS))
+    )
+    normalized["Urlaubstag h"] = normalized["Urlaubstag h"].map(
+        lambda value: max(0.0, parse_hour_value(value, DEFAULT_VACATION_DAY_HOURS))
     )
     normalized["Übernahme bestätigt"] = normalized["Übernahme bestätigt"].map(
         lambda value: parse_bool_value(value, False)
@@ -4329,6 +5780,8 @@ def employees_from_editor(
                 ),
                 annual_vacation_weeks=max(0.0, float(row.get("Urlaubswochen/Jahr", DEFAULT_ANNUAL_VACATION_WEEKS) or DEFAULT_ANNUAL_VACATION_WEEKS)),
                 vacation_start_date=parse_date_value(row.get("Urlaubs-Stichtag", DEFAULT_VACATION_START_DATE.isoformat())).isoformat(),
+                annual_vacation_workdays=max(0.0, parse_hour_value(row.get("Urlaubstage/Jahr", DEFAULT_ANNUAL_VACATION_WORKDAYS), DEFAULT_ANNUAL_VACATION_WORKDAYS)),
+                vacation_day_hours=max(0.0, parse_hour_value(row.get("Urlaubstag h", DEFAULT_VACATION_DAY_HOURS), DEFAULT_VACATION_DAY_HOURS)),
                 prefers_joint_weekends=bool(row.get("Gemeinsame Wochenenden", True)),
                 joint_weekend_priority=priority_value(row.get("Prio gemeinsame Wochenenden", DEFAULT_PRIORITY_LABEL)),
                 takeover_confirmed=parse_bool_value(row.get("Übernahme bestätigt", False), False),
@@ -4389,6 +5842,8 @@ def employee_dialog(row_index: int | None = None) -> None:
             "Krankenstand je Monat": "",
             "Urlaub je Monat": "",
             "Urlaubswochen/Jahr": float(st.session_state.get("global_annual_vacation_weeks", DEFAULT_ANNUAL_VACATION_WEEKS)),
+            "Urlaubstage/Jahr": float(st.session_state.get("global_annual_vacation_workdays", DEFAULT_ANNUAL_VACATION_WORKDAYS)),
+            "Urlaubstag h": float(st.session_state.get("global_vacation_day_hours", DEFAULT_VACATION_DAY_HOURS)),
             "Urlaubs-Stichtag": DEFAULT_VACATION_START_DATE.isoformat(),
             "Übernahme bestätigt": False,
             "Übernahme Startdatum": "",
@@ -4629,7 +6084,20 @@ def employee_dialog(row_index: int | None = None) -> None:
                     max_value=10.0,
                     value=float(current.get("Urlaubswochen/Jahr", DEFAULT_ANNUAL_VACATION_WEEKS)),
                     step=0.5,
-                    help="5 Wochen bedeuten: Jahresurlaub = 5 x Wochenstunden.",
+                    help="Orientierung in Wochen. Die genaue Stundenrechnung nutzt die Urlaubstage und den Stundenwert darunter.",
+                )
+                vacation_workdays = st.number_input(
+                    "Urlaubstage pro Urlaubsjahr",
+                    min_value=0.0,
+                    max_value=60.0,
+                    value=float(current.get("Urlaubstage/Jahr", DEFAULT_ANNUAL_VACATION_WORKDAYS)),
+                    step=1.0,
+                    help="Bei 5 Wochen und 5-Tage-Woche sind das meist 25 Arbeitstage.",
+                )
+                vacation_day_hours_text = st.text_input(
+                    "Stundenwert pro Urlaubstag",
+                    value=format_hour_value(current.get("Urlaubstag h", DEFAULT_VACATION_DAY_HOURS)),
+                    help="0 bedeutet automatisch: Wochenstunden / 5. Für andere Modelle hier den fixen Tageswert eintragen.",
                 )
                 vacation_start_date = st.date_input(
                     "Urlaubs-Stichtag / Eintrittsdatum",
@@ -4806,6 +6274,8 @@ def employee_dialog(row_index: int | None = None) -> None:
                 vacation_days=tuple(day - 1 for day in vacation_selected_days),
                 annual_vacation_weeks=annual_vacation_weeks,
                 vacation_start_date=vacation_start_date.isoformat(),
+                annual_vacation_workdays=vacation_workdays,
+                vacation_day_hours=max(0.0, parse_hour_value(vacation_day_hours_text, DEFAULT_VACATION_DAY_HOURS)),
             )
             vacation_used_hours = format_minutes_as_hours(
                 vacation_paid_minutes_for_month(vacation_preview_employee, month_days, True)
@@ -4940,6 +6410,8 @@ def employee_dialog(row_index: int | None = None) -> None:
             "Krankenstand je Monat": updated_sick_months,
             "Urlaub je Monat": updated_vacation_months,
             "Urlaubswochen/Jahr": annual_vacation_weeks,
+            "Urlaubstage/Jahr": vacation_workdays,
+            "Urlaubstag h": max(0.0, parse_hour_value(vacation_day_hours_text, DEFAULT_VACATION_DAY_HOURS)),
             "Urlaubs-Stichtag": vacation_start_date.isoformat(),
             "Übernahme bestätigt": takeover_confirmed,
             "Übernahme Startdatum": takeover_start_date.isoformat() if takeover_start_date else "",
@@ -5331,6 +6803,218 @@ def low_satisfaction_people_dataframe(metrics_df: pd.DataFrame, limit: int = 6) 
     return pd.DataFrame(rows)
 
 
+def plan_explanation_dataframe(
+    metrics_df: pd.DataFrame,
+    open_services: pd.DataFrame,
+    rule_checks: list[dict[str, str]] | None,
+    solver_status: str | None,
+) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    rule_checks = rule_checks or []
+    if metrics_df.empty:
+        return pd.DataFrame(rows)
+
+    satisfaction_series = pd.to_numeric(
+        metrics_df.get("Zufriedenheit %", pd.Series([0])),
+        errors="coerce",
+    ).fillna(0)
+    average_satisfaction = float(satisfaction_series.mean() or 0)
+    minimum_satisfaction = float(satisfaction_series.min() or 0)
+    warning_count = int(pd.to_numeric(metrics_df.get("Aktive Warnungen", pd.Series([0])), errors="coerce").fillna(0).sum())
+    rule_error_count = sum(1 for check in rule_checks if check.get("Status") == "Fehler")
+    rule_hint_count = sum(1 for check in rule_checks if check.get("Status") == "Hinweis")
+    open_count = int(open_services["Offen"].sum()) if open_services is not None and not open_services.empty else 0
+
+    if rule_error_count:
+        rows.append(
+            {
+                "Bereich": "Rechtliche Sicherheit",
+                "Bewertung": "rot",
+                "Warum?": f"{rule_error_count} harte Regelverletzung(en)",
+                "Was tun?": "Nicht fixieren. Regelprüfung öffnen und diese Fehler zuerst beheben.",
+            }
+        )
+    elif rule_hint_count:
+        rows.append(
+            {
+                "Bereich": "Rechtliche Sicherheit",
+                "Bewertung": "gelb",
+                "Warum?": f"Harte Regeln OK, aber {rule_hint_count} Hinweis(e)",
+                "Was tun?": "Hinweise wie Durchrechnung oder verkürzte Wochenruhe bewusst prüfen.",
+            }
+        )
+    else:
+        rows.append(
+            {
+                "Bereich": "Rechtliche Sicherheit",
+                "Bewertung": "grün",
+                "Warum?": "Keine harten Regelverletzungen gefunden",
+                "Was tun?": "Plan kann fachlich weiter geprüft werden.",
+            }
+        )
+
+    if average_satisfaction >= 90 and minimum_satisfaction >= 70:
+        satisfaction_action = "Plan ist aus Zufriedenheitssicht stark. Nur offene Dienste und Hinweise prüfen."
+    elif average_satisfaction >= 80:
+        satisfaction_action = "Schlechteste Personen und wichtigste Wunschverletzungen prüfen."
+    else:
+        satisfaction_action = "Nicht sofort fixieren. Wünsche, Nacht-/Wochenendfähigkeit und Bedarf gezielt anpassen."
+    rows.append(
+        {
+            "Bereich": "Mitarbeiterzufriedenheit",
+            "Bewertung": "grün" if average_satisfaction >= 90 and minimum_satisfaction >= 70 else ("gelb" if average_satisfaction >= 80 else "rot"),
+            "Warum?": f"{format_display_hours(round(average_satisfaction, 1))} % Durchschnitt, schlechtester Wert {format_display_hours(round(minimum_satisfaction, 1))} %",
+            "Was tun?": satisfaction_action,
+        }
+    )
+
+    if open_count:
+        open_by_priority = ""
+        if "Prioritaet" in open_services.columns:
+            grouped = (
+                open_services.groupby("Prioritaet")["Offen"].sum().sort_index()
+                if not open_services.empty
+                else pd.Series(dtype=int)
+            )
+            open_by_priority = ", ".join(f"Prio {priority}: {int(count)}" for priority, count in grouped.items())
+        rows.append(
+            {
+                "Bereich": "Abdeckung",
+                "Bewertung": "gelb" if open_count <= 10 else "rot",
+                "Warum?": f"{open_count} offene Dienste" + (f" ({open_by_priority})" if open_by_priority else ""),
+                "Was tun?": "Offene Dienste nach Priorität prüfen. Bei Prio-1-Offenstand Bedarf, Regeln oder Personal korrigieren.",
+            }
+        )
+    else:
+        rows.append(
+            {
+                "Bereich": "Abdeckung",
+                "Bewertung": "grün",
+                "Warum?": "Alle Dienste besetzt",
+                "Was tun?": "Keine Änderung nötig.",
+            }
+        )
+
+    if warning_count:
+        rows.append(
+            {
+                "Bereich": "Wunschverletzungen",
+                "Bewertung": "gelb" if warning_count <= 20 else "rot",
+                "Warum?": f"{warning_count} aktive Warnung(en)",
+                "Was tun?": "Handlungsanweisungen öffnen und zuerst Priorität 1 bis 3 bearbeiten.",
+            }
+        )
+
+    rows.append(
+        {
+            "Bereich": "Optimierungsbeweis",
+            "Bewertung": "grün" if solver_status == "OPTIMAL" else "gelb",
+            "Warum?": solver_status_detail(solver_status),
+            "Was tun?": "Bei gültig, nicht optimal bewiesen: Weiter optimieren verwenden, wenn Zeit bleibt." if solver_status != "OPTIMAL" else "Kein weiterer Optimierungsschritt nötig.",
+        }
+    )
+    return pd.DataFrame(rows)
+
+
+def render_replacement_search(
+    schedule: dict,
+    metrics: dict,
+    days: list[date],
+    employees: list[Employee],
+    daily_requirements: dict[tuple[int, str], int],
+    shift_df: pd.DataFrame,
+    shifts: list[str],
+    night_shifts: list[str],
+    shift_minutes_by_code: dict[str, int],
+    shift_time_by_code: dict[str, tuple[int, int]],
+    previous_assignments: dict[str, list[str]] | None,
+    *,
+    key_prefix: str,
+) -> None:
+    if not schedule or not days or not shifts:
+        return
+    with st.expander("Ersatz suchen / Dienst tauschen", expanded=False):
+        st.caption(
+            "Diese Liste ist nur eine Entscheidungshilfe. Der Dienstplan wird dadurch noch nicht geändert."
+        )
+        date_labels = [day_label(current_day) for current_day in days]
+        search_cols = st.columns([0.35, 0.65])
+        with search_cols[0]:
+            selected_date_label = st.selectbox(
+                "Datum",
+                options=date_labels,
+                index=0,
+                key=f"{key_prefix}_replacement_date",
+            )
+        day_index = date_labels.index(selected_date_label)
+        shift_options = replacement_shift_options(
+            schedule,
+            day_index,
+            daily_requirements,
+            shift_df,
+            shifts,
+        )
+        shift_labels = [label for _, label in shift_options]
+        with search_cols[1]:
+            selected_shift_label = st.selectbox(
+                "Dienst",
+                options=shift_labels,
+                index=0,
+                key=f"{key_prefix}_replacement_shift_{day_index}",
+            )
+        target_shift = dict((label, shift) for shift, label in shift_options)[selected_shift_label]
+        demand = int(daily_requirements.get((day_index, target_shift), 0) or 0)
+        assigned_names = [
+            str(employee_name)
+            for employee_name, assignments in schedule.items()
+            if day_index < len(assignments) and first_real_shift(assignments[day_index]) == target_shift
+        ]
+        missing_count = max(0, demand - len(assigned_names))
+        if assigned_names:
+            st.caption(
+                "Aktuell eingeteilt: "
+                + ", ".join(assigned_names[:6])
+                + (f" und {len(assigned_names) - 6} weitere" if len(assigned_names) > 6 else "")
+            )
+        if missing_count:
+            st.warning(f"Für diesen Dienst sind aktuell {missing_count} Position(en) offen.")
+
+        candidate_df, hidden_count = replacement_candidate_dataframe(
+            schedule=schedule,
+            metrics=metrics,
+            employees=employees,
+            days=days,
+            day_index=day_index,
+            target_shift=target_shift,
+            shifts=shifts,
+            night_shifts=night_shifts,
+            shift_minutes_by_code=shift_minutes_by_code,
+            shift_time_by_code=shift_time_by_code,
+            previous_assignments=previous_assignments,
+            vacation_weekend_policy=st.session_state.get("vacation_weekend_policy", DEFAULT_VACATION_WEEKEND_POLICY),
+            block_night_before_wish_free=bool(st.session_state.get("block_night_before_wish_free", True)),
+            daily_max_work_hours=float(st.session_state.get("daily_max_work_hours", 12.0)),
+            max_overtime_percent=float(st.session_state.get("max_overtime_percent", 10)),
+            max_overtime_hours=float(st.session_state.get("max_overtime_hours", 12)),
+            night_credit_mode=str(st.session_state.get("night_credit_mode", DEFAULT_NIGHT_CREDIT_MODE)),
+            night_credit_hours=float(st.session_state.get("night_credit_hours", DEFAULT_NIGHT_CREDIT_HOURS)),
+        )
+        if candidate_df.empty:
+            st.error(
+                "Für diesen Dienst wurde keine rechtlich/regellogisch passende Ersatzperson gefunden."
+            )
+        else:
+            st.dataframe(germanize_dataframe(candidate_df), width="stretch", hide_index=True)
+            st.caption(
+                "Sortiert nach Regelcheck, Wunschkonflikten, Monatsstunden und gesamtem Zeitkonto nach Plan."
+            )
+        if hidden_count:
+            st.caption(
+                f"{hidden_count} Person(en) werden nicht angezeigt, weil sie bereits eingeteilt, abwesend "
+                "oder nach harten Regeln nicht passend sind."
+            )
+
+
 def render_plan_result(
     schedule: dict,
     metrics: dict,
@@ -5346,7 +7030,16 @@ def render_plan_result(
     shift_priority_by_code: dict[str, int] | None = None,
     solver_status: str | None = None,
     calculation_mode: str | None = None,
+    shifts: list[str] | None = None,
+    night_shifts: list[str] | None = None,
+    shift_minutes_by_code: dict[str, int] | None = None,
+    shift_time_by_code: dict[str, tuple[int, int]] | None = None,
+    previous_assignments: dict[str, list[str]] | None = None,
 ) -> None:
+    shifts = shifts or shift_codes(shift_df)
+    night_shifts = night_shifts or night_shift_codes(shift_df)
+    shift_minutes_by_code = shift_minutes_by_code or shift_minutes(shift_df)
+    shift_time_by_code = shift_time_by_code or shift_time_windows(shift_df)
     metrics_df = pd.DataFrame.from_dict(metrics, orient="index").reset_index(names="Name")
     for column in [
         "Aktive Warnungen",
@@ -5369,6 +7062,29 @@ def render_plan_result(
         open_shift_codes=open_shift_codes,
         shift_priority_by_code=shift_priority_by_code,
     )
+    cleaned_rule_checks = []
+    for check in rule_checks or []:
+        pruefung = str(check.get("Prüfung", ""))
+        status = str(check.get("Status", ""))
+        if pruefung == "Ruhepause" and status == "Hinweis":
+            continue
+        if pruefung == "Offene Dienste" and status == "Hinweis":
+            continue
+        cleaned_rule_checks.append(dict(check))
+    hard_open_count = 0
+    if not open_services.empty and "Prioritaet" in open_services.columns:
+        hard_open_count = int(open_services[open_services["Prioritaet"].astype(int) == 1]["Offen"].sum())
+    if hard_open_count and not any(check.get("Prüfung") == "Offene Pflichtdienste" for check in cleaned_rule_checks):
+        cleaned_rule_checks.append(
+            {
+                "Status": "Fehler",
+                "Prüfung": "Offene Pflichtdienste",
+                "Ergebnis": f"{hard_open_count} Prio-1-Dienst(e) bleiben offen.",
+                "Was tun?": "Pflichtdienste prüfen, Personal erhöhen oder harte Grenzwerte lockern.",
+            }
+        )
+    rule_checks = cleaned_rule_checks
+    rule_error_count = sum(1 for check in rule_checks if check.get("Status") == "Fehler")
     open_service_count = int(open_services["Offen"].sum()) if not open_services.empty else 0
     average_satisfaction = (
         round(float(metrics_df["Zufriedenheit %"].mean()), 1)
@@ -5379,6 +7095,16 @@ def render_plan_result(
         float(pd.to_numeric(metrics_df.get("Stundenabweichung h", pd.Series([0])), errors="coerce").fillna(0).max())
         if not metrics_df.empty
         else 0
+    )
+
+    st.markdown("**Qualitätsampel**")
+    render_traffic_light_cards(
+        plan_quality_signal_rows(
+            metrics_df,
+            rule_checks,
+            open_service_count,
+            solver_status,
+        )
     )
 
     summary_cols = st.columns(6)
@@ -5405,8 +7131,37 @@ def render_plan_result(
     if calculation_mode:
         st.caption(f"Berechnungsart: {normalize_calculation_mode(calculation_mode)}")
 
+    if rule_checks:
+        rule_df = pd.DataFrame(rule_checks)
+        problem_rules = rule_df[rule_df["Status"].isin(["Fehler", "Hinweis"])]
+        if not problem_rules.empty:
+            with st.expander(
+                f"Rechtliche Hinweise anzeigen ({len(problem_rules)})",
+                expanded=rule_error_count > 0,
+            ):
+                st.dataframe(germanize_dataframe(problem_rules), width="stretch", hide_index=True)
+
+    explanation_df = plan_explanation_dataframe(
+        metrics_df,
+        open_services,
+        rule_checks,
+        solver_status,
+    )
+    if not explanation_df.empty:
+        with st.expander("Warum sieht dieser Plan so aus?", expanded=open_service_count > 0 or average_satisfaction < 85):
+            st.caption(
+                "Diese Erklärung übersetzt Kennzahlen in konkrete Bedeutung: rechtliche Sicherheit, Zufriedenheit, Abdeckung und Beweisgrad."
+            )
+            st.dataframe(germanize_dataframe(explanation_df), width="stretch", hide_index=True)
+
     action_df = satisfaction_action_dataframe(metrics_df, open_services)
     low_people_df = low_satisfaction_people_dataframe(metrics_df)
+    needs_attention = (
+        average_satisfaction < 85
+        or open_service_count > 0
+        or total_violations > 0
+        or rule_error_count > 0
+    )
     if average_satisfaction < 50:
         st.error(
             "Die Zufriedenheit ist sehr niedrig. Bitte diesen Plan erst fixieren, "
@@ -5418,12 +7173,27 @@ def render_plan_result(
         st.success("Die Zufriedenheit ist im guten Bereich.")
 
     if not action_df.empty or not low_people_df.empty:
-        with st.expander("Zufriedenheit verbessern - konkrete Handlungsanweisungen", expanded=average_satisfaction < 75):
+        with st.expander("Zufriedenheit verbessern - konkrete Handlungsanweisungen", expanded=needs_attention):
             if not action_df.empty:
                 st.dataframe(germanize_dataframe(action_df), width="stretch", hide_index=True)
             if not low_people_df.empty:
                 st.markdown("**Personen zuerst prüfen**")
                 st.dataframe(low_people_df, width="stretch", hide_index=True)
+
+    render_replacement_search(
+        schedule=schedule,
+        metrics=metrics,
+        days=days,
+        employees=employees,
+        daily_requirements=daily_requirements,
+        shift_df=shift_df,
+        shifts=shifts,
+        night_shifts=night_shifts,
+        shift_minutes_by_code=shift_minutes_by_code,
+        shift_time_by_code=shift_time_by_code,
+        previous_assignments=previous_assignments,
+        key_prefix="fixed" if fixed else "draft",
+    )
 
     employee_tab, calendar_tab, metrics_tab = st.tabs(
         ["Mitarbeiteransicht", "Kalenderansicht", "Auswertung"]
@@ -5436,7 +7206,6 @@ def render_plan_result(
 
     with calendar_tab:
         control_cols = st.columns(3)
-        rule_error_count = sum(1 for check in (rule_checks or []) if check.get("Status") == "Fehler")
         control_cols[0].metric("Offene Dienste", open_service_count)
         control_cols[1].metric("Regelfehler", rule_error_count)
         control_cols[2].metric("Warnungen", total_violations)
@@ -5465,7 +7234,14 @@ def render_plan_result(
             )
 
     with metrics_tab:
-        display_metrics_df = metrics_df.drop(columns=["Verstossdetails nach Prioritaet"], errors="ignore")
+        display_metrics_df = metrics_df.drop(
+            columns=[
+                "Verstossdetails nach Prioritaet",
+                "Verletzungen Prio 4",
+                "Verletzungen Prio 5",
+            ],
+            errors="ignore",
+        )
         st.dataframe(germanize_dataframe(display_metrics_df), width="stretch", hide_index=True)
         st.caption(
             "Sollstunden werden anteilig für den geplanten Monat berechnet. "
@@ -5488,14 +7264,12 @@ def render_plan_result(
     else:
         st.info(
             f"Es gibt {total_violations} aktive Verstöße in den Prioritäten 1 bis 3. "
-            "Priorität 4 und 5 werden nur als nachrangige Info angezeigt."
+            "Die wichtigsten Details stehen in den folgenden Bereichen."
         )
-    for priority in range(1, 6):
+    for priority in range(1, 4):
         column_name = f"Verletzungen Prio {priority}"
         category_total = int(metrics_df[column_name].sum()) if column_name in metrics_df else 0
         title = f"Priorität {priority}: {category_total} Verstoß(e)"
-        if priority >= 4:
-            title += " - zählt nicht zur Warnsumme"
         with st.expander(title, expanded=priority <= 3 and category_total > 0):
             if category_total == 0:
                 st.caption("Keine Verstöße in dieser Kategorie.")
@@ -5792,6 +7566,41 @@ st.session_state.vacation_weekend_policy = normalize_vacation_weekend_policy(
 )
 if "global_annual_vacation_weeks" not in st.session_state:
     st.session_state.global_annual_vacation_weeks = DEFAULT_ANNUAL_VACATION_WEEKS
+if "global_annual_vacation_workdays" not in st.session_state:
+    st.session_state.global_annual_vacation_workdays = DEFAULT_ANNUAL_VACATION_WORKDAYS
+if "global_vacation_day_hours" not in st.session_state:
+    st.session_state.global_vacation_day_hours = DEFAULT_VACATION_DAY_HOURS
+if "legal_profile" not in st.session_state:
+    st.session_state.legal_profile = DEFAULT_LEGAL_PROFILE
+st.session_state.legal_profile = normalize_legal_profile(st.session_state.legal_profile)
+legal_defaults = legal_profile_defaults(st.session_state.legal_profile)
+if "daily_max_work_hours" not in st.session_state:
+    st.session_state.daily_max_work_hours = legal_defaults["daily_max_hours"]
+if "weekly_average_max_hours" not in st.session_state:
+    st.session_state.weekly_average_max_hours = legal_defaults["weekly_average_max_hours"]
+if "weekly_average_period_weeks" not in st.session_state:
+    st.session_state.weekly_average_period_weeks = legal_defaults["weekly_average_period_weeks"]
+if "weekly_rest_hours" not in st.session_state:
+    st.session_state.weekly_rest_hours = legal_defaults["weekly_rest_hours"]
+if "reduced_weekly_rest_hours" not in st.session_state:
+    st.session_state.reduced_weekly_rest_hours = legal_defaults["reduced_weekly_rest_hours"]
+if "allow_reduced_weekly_rest" not in st.session_state:
+    st.session_state.allow_reduced_weekly_rest = legal_defaults["allow_reduced_weekly_rest"]
+if "pause_policy" not in st.session_state:
+    st.session_state.pause_policy = DEFAULT_PAUSE_POLICY
+st.session_state.pause_policy = normalize_pause_policy(st.session_state.pause_policy)
+if "pause_threshold_hours" not in st.session_state:
+    st.session_state.pause_threshold_hours = legal_defaults["pause_after_hours"]
+if "pause_duration_minutes" not in st.session_state:
+    st.session_state.pause_duration_minutes = legal_defaults["pause_minutes"]
+st.session_state.pause_threshold_hours = max(
+    0.0,
+    parse_hour_value(st.session_state.pause_threshold_hours, DEFAULT_PAUSE_THRESHOLD_HOURS),
+)
+try:
+    st.session_state.pause_duration_minutes = max(0, int(round(float(st.session_state.pause_duration_minutes))))
+except (TypeError, ValueError):
+    st.session_state.pause_duration_minutes = DEFAULT_PAUSE_DURATION_MINUTES
 if "max_overtime_percent" not in st.session_state:
     st.session_state.max_overtime_percent = 10
 if "max_overtime_hours" not in st.session_state:
@@ -5806,6 +7615,11 @@ if "time_separator" not in st.session_state:
     st.session_state.time_separator = ":"
 if "replacement_rest_enabled" not in st.session_state:
     st.session_state.replacement_rest_enabled = True
+if "replacement_rest_kind" not in st.session_state:
+    st.session_state.replacement_rest_kind = DEFAULT_REPLACEMENT_REST_KIND
+st.session_state.replacement_rest_kind = normalize_replacement_rest_kind(
+    st.session_state.replacement_rest_kind
+)
 if "replacement_rest_scope" not in st.session_state:
     st.session_state.replacement_rest_scope = normalize_replacement_rest_scope(
         None,
@@ -5817,6 +7631,18 @@ else:
         enabled=bool(st.session_state.replacement_rest_enabled),
     )
 st.session_state.replacement_rest_enabled = st.session_state.replacement_rest_scope != "Keine Ersatzruhe"
+if "night_credit_mode" not in st.session_state:
+    st.session_state.night_credit_mode = DEFAULT_NIGHT_CREDIT_MODE
+st.session_state.night_credit_mode = normalize_night_credit_mode(st.session_state.night_credit_mode)
+if "night_credit_hours" not in st.session_state:
+    st.session_state.night_credit_hours = DEFAULT_NIGHT_CREDIT_HOURS
+st.session_state.night_credit_hours = max(
+    0.0,
+    parse_hour_value(st.session_state.night_credit_hours, DEFAULT_NIGHT_CREDIT_HOURS),
+)
+if "time_account_usage" not in st.session_state:
+    st.session_state.time_account_usage = DEFAULT_TIME_ACCOUNT_USAGE
+st.session_state.time_account_usage = normalize_time_account_usage(st.session_state.time_account_usage)
 if "global_max_consecutive_workdays" not in st.session_state:
     st.session_state.global_max_consecutive_workdays = 6
 if "global_max_nights_per_month" not in st.session_state:
@@ -5870,10 +7696,35 @@ if "selected_year" not in st.session_state:
     st.session_state.selected_year = current_year
 if "selected_month" not in st.session_state:
     st.session_state.selected_month = date.today().month
+if "manual_month_view" not in st.session_state:
+    st.session_state.manual_month_view = False
 if "planning_start_year" not in st.session_state:
     st.session_state.planning_start_year = int(st.session_state.selected_year)
 if "planning_start_month" not in st.session_state:
     st.session_state.planning_start_month = int(st.session_state.selected_month)
+
+next_plan_year, next_plan_month = next_open_plan_month(
+    st.session_state.saved_schedules,
+    int(st.session_state.planning_start_year),
+    int(st.session_state.planning_start_month),
+)
+start_position = month_sequence_number(
+    int(st.session_state.planning_start_year),
+    int(st.session_state.planning_start_month),
+)
+selected_position = month_sequence_number(
+    int(st.session_state.selected_year),
+    int(st.session_state.selected_month),
+)
+next_plan_position = month_sequence_number(next_plan_year, next_plan_month)
+if (
+    not bool(st.session_state.manual_month_view)
+    or selected_position < start_position
+    or selected_position > next_plan_position
+):
+    st.session_state.selected_year = next_plan_year
+    st.session_state.selected_month = next_plan_month
+    st.session_state.manual_month_view = False
 
 selected_year = int(st.session_state.selected_year)
 selected_month = int(st.session_state.selected_month)
@@ -5896,8 +7747,17 @@ st.session_state.shifts_df = shift_definitions_from_editor(st.session_state.shif
 shifts = shift_codes(st.session_state.shifts_df)
 night_shifts = night_shift_codes(st.session_state.shifts_df)
 shift_priority_by_code = shift_priorities(st.session_state.shifts_df)
-shift_hours_by_code = shift_hours(st.session_state.shifts_df)
-shift_minutes_by_code = shift_minutes(st.session_state.shifts_df)
+raw_shift_minutes_by_code = shift_minutes(st.session_state.shifts_df)
+shift_minutes_by_code = effective_shift_minutes_by_pause_policy(
+    raw_shift_minutes_by_code,
+    st.session_state.pause_policy,
+    st.session_state.pause_threshold_hours,
+    st.session_state.pause_duration_minutes,
+)
+shift_hours_by_code = {
+    code: format_minutes_as_hours(minutes)
+    for code, minutes in shift_minutes_by_code.items()
+}
 shift_time_by_code = shift_time_windows(st.session_state.shifts_df)
 st.session_state.resources_df = normalize_resource_dataframe(st.session_state.resources_df, shifts)
 resource_requirements = resource_requirements_from_editor(st.session_state.resources_df, shifts)
@@ -5908,8 +7768,14 @@ daily_requirements = apply_day_overrides(daily_requirements, month_key, shifts)
 employees = employees_from_editor(st.session_state.employees_df)
 planning_employees = active_schedule_employees(employees)
 
-planning_tab, employees_tab, resources_tab, settings_tab = st.tabs(
-    ["Dienstplan & Auswertung", "Mitarbeiter & Wünsche", "Dienstformen & Ressourcen", "Einstellungen"]
+planning_tab, employees_tab, resources_tab, settings_tab, help_tab = st.tabs(
+    [
+        "Dienstplan & Auswertung",
+        "Mitarbeiter & Wünsche",
+        "Dienstformen & Ressourcen",
+        "Einstellungen",
+        "Hilfe & Prüflogik",
+    ]
 )
 
 if st.session_state.get("employee_dialog_open", False):
@@ -6160,6 +8026,34 @@ with resources_tab:
     daily_requirements = requirements_for_days(days, holidays, resource_requirements, shifts)
     daily_requirements = apply_day_overrides(daily_requirements, month_key, shifts)
 
+    resource_staffing_summary, resource_staffing_df = staffing_hours_overview(
+        employees=planning_employees,
+        daily_requirements=daily_requirements,
+        shifts=shifts,
+        shift_priority_by_code=shift_priority_by_code,
+        shift_minutes_by_code=shift_minutes_by_code,
+        open_shift_codes=[],
+        day_count=len(days),
+        max_overtime_percent=float(st.session_state.max_overtime_percent),
+        max_overtime_hours=float(st.session_state.max_overtime_hours),
+        max_undertime_percent=float(st.session_state.max_undertime_percent),
+        max_undertime_hours=float(st.session_state.max_undertime_hours),
+        days=days,
+        holidays=holidays,
+        replacement_rest_scope=st.session_state.replacement_rest_scope,
+        compensatory_rest_counts_as_hours=(
+            bool(st.session_state.replacement_rest_enabled)
+            and bool(st.session_state.compensatory_rest_counts_as_hours)
+        ),
+        vacation_counts_as_hours=True,
+    )
+    with st.expander("Stunden nach Dienstform-Priorität", expanded=False):
+        st.caption(
+            "Diese Übersicht gehört zu den Dienstformen: Prio 1 muss besetzt werden, "
+            "Prio 2 und 3 dürfen bei Engpässen offen bleiben."
+        )
+        render_static_table(resource_staffing_df)
+
     st.subheader("Kalenderprüfung")
     st.caption("Hier kannst du einzelne Tage manuell anpassen, wenn an einem Datum mehr oder weniger Dienste gebraucht werden.")
     day_requirements_df = day_requirements_dataframe(days, holidays, daily_requirements, shifts)
@@ -6255,11 +8149,40 @@ with settings_tab:
             st.session_state.employees_df["Gemeinsame Wochenenden"] = bool(st.session_state.global_joint_weekends)
             st.session_state.employees_df["Prio gemeinsame Wochenenden"] = st.session_state.global_joint_weekends_priority
             st.session_state.employees_df["Urlaubswochen/Jahr"] = float(st.session_state.global_annual_vacation_weeks)
+            st.session_state.employees_df["Urlaubstage/Jahr"] = float(st.session_state.global_annual_vacation_workdays)
+            st.session_state.employees_df["Urlaubstag h"] = float(st.session_state.global_vacation_day_hours)
             st.success("Globale Mitarbeitereinstellungen wurden übernommen.")
 
     st.divider()
     st.subheader("Globale Dienstplan- und Zeiteinstellungen")
     st.caption("Bei Plus- und Minusstunden gilt: 0 deaktiviert genau diese Grenze. Sind Prozent und Stunden gesetzt, gewinnt die niedrigere aktive Grenze.")
+
+    planning_start_value = date(
+        int(st.session_state.planning_start_year),
+        int(st.session_state.planning_start_month),
+        1,
+    )
+    selected_start_date = st.date_input(
+        "Planungsstart",
+        value=planning_start_value,
+        min_value=date(current_year - 1, 1, 1),
+        max_value=date(current_year + 3, 12, 31),
+        help="Ab diesem Monat startet die laufende Planung. Danach wird Monat für Monat weitergeplant.",
+    )
+    selected_start_month_date = date(int(selected_start_date.year), int(selected_start_date.month), 1)
+    if selected_start_month_date != planning_start_value:
+        st.session_state.planning_start_year = selected_start_month_date.year
+        st.session_state.planning_start_month = selected_start_month_date.month
+        new_year, new_month = next_open_plan_month(
+            st.session_state.saved_schedules,
+            selected_start_month_date.year,
+            selected_start_month_date.month,
+        )
+        st.session_state.selected_year = new_year
+        st.session_state.selected_month = new_month
+        st.session_state.manual_month_view = False
+        st.session_state.generated_plan = None
+        st.rerun()
 
     format_cols = st.columns(2)
     with format_cols[0]:
@@ -6290,6 +8213,115 @@ with settings_tab:
         st.session_state.plan_includes_weekends = st.checkbox(
             "Mit Wochenenden/Feiertagen",
             value=bool(st.session_state.plan_includes_weekends),
+        )
+
+    st.markdown("**Ruhepausen**")
+    st.caption("Lege fest, ob die Pause bereits in der Dienstform enthalten ist oder von den berechneten Dienststunden abgezogen wird.")
+    pause_cols = st.columns(3)
+    with pause_cols[0]:
+        st.session_state.pause_policy = st.selectbox(
+            "Pausenmodell",
+            options=PAUSE_POLICY_OPTIONS,
+            index=PAUSE_POLICY_OPTIONS.index(normalize_pause_policy(st.session_state.pause_policy)),
+            help=(
+                "Standard: Die Dienstform enthält die bezahlte Pause bereits. "
+                "Nur bei unbezahlter Pause werden die berechneten Dienststunden gekürzt."
+            ),
+        )
+    pause_is_deducted = st.session_state.pause_policy == "Pause unbezahlt und von Dienstzeit abziehen"
+    with pause_cols[1]:
+        pause_threshold_text = st.text_input(
+            "Pause verpflichtend ab h",
+            value=format_hour_value(st.session_state.pause_threshold_hours),
+            disabled=not pause_is_deducted,
+            help="Ab dieser Dienstlänge wird die Pausenzeit von den Dienststunden abgezogen.",
+        )
+        if pause_is_deducted:
+            st.session_state.pause_threshold_hours = max(
+                0.0,
+                parse_hour_value(pause_threshold_text, float(st.session_state.pause_threshold_hours)),
+            )
+    with pause_cols[2]:
+        st.session_state.pause_duration_minutes = st.number_input(
+            "Pausendauer Minuten",
+            min_value=0,
+            max_value=180,
+            value=int(st.session_state.pause_duration_minutes),
+            step=5,
+            disabled=not pause_is_deducted,
+            help="Diese Minuten werden bei Variante 2 von langen Diensten abgezogen.",
+        )
+    if pause_is_deducted:
+        st.info(
+            "Bei diesem Modell bleiben Beginn und Ende der Dienstform gleich, aber die berechneten Dienststunden werden um die Pause reduziert."
+        )
+    else:
+        st.caption("Die Dienststunden bleiben unverändert, weil die Pause laut Einstellung bezahlt und bereits enthalten ist.")
+
+    st.markdown("**Rechtsprofil und harte Schutzregeln**")
+    legal_profile_cols = st.columns(3)
+    with legal_profile_cols[0]:
+        selected_legal_profile = st.selectbox(
+            "Rechtsprofil",
+            options=LEGAL_PROFILE_OPTIONS,
+            index=LEGAL_PROFILE_OPTIONS.index(normalize_legal_profile(st.session_state.legal_profile)),
+            help="Legt die Standardgrenzen für Tageshöchstarbeitszeit, Wochenruhe und 48h-Durchrechnung fest.",
+        )
+        if selected_legal_profile != st.session_state.legal_profile:
+            st.session_state.legal_profile = selected_legal_profile
+            profile_defaults = legal_profile_defaults(selected_legal_profile)
+            st.session_state.daily_max_work_hours = profile_defaults["daily_max_hours"]
+            st.session_state.weekly_average_max_hours = profile_defaults["weekly_average_max_hours"]
+            st.session_state.weekly_average_period_weeks = profile_defaults["weekly_average_period_weeks"]
+            st.session_state.weekly_rest_hours = profile_defaults["weekly_rest_hours"]
+            st.session_state.reduced_weekly_rest_hours = profile_defaults["reduced_weekly_rest_hours"]
+            st.session_state.allow_reduced_weekly_rest = profile_defaults["allow_reduced_weekly_rest"]
+            st.rerun()
+        st.session_state.daily_max_work_hours = st.number_input(
+            "Tageshöchstgrenze h",
+            min_value=1.0,
+            max_value=25.0,
+            value=float(st.session_state.daily_max_work_hours),
+            step=0.5,
+            help="Dienste über dieser Grenze werden nicht eingeplant und in der Regelprüfung als Fehler markiert.",
+        )
+    with legal_profile_cols[1]:
+        st.session_state.weekly_rest_hours = st.number_input(
+            "Wochenruhe Ziel h",
+            min_value=24.0,
+            max_value=72.0,
+            value=float(st.session_state.weekly_rest_hours),
+            step=1.0,
+            help="Zielwert für die wöchentliche zusammenhängende Ruhezeit.",
+        )
+        st.session_state.allow_reduced_weekly_rest = st.checkbox(
+            "Schicht-Verkürzung erlauben",
+            value=bool(st.session_state.allow_reduced_weekly_rest),
+            help="Für Schichtmodelle: eine verkürzte Wochenruhe wird als Hinweis akzeptiert, der 4-Wochen-Schnitt wird geprüft.",
+        )
+        st.session_state.reduced_weekly_rest_hours = st.number_input(
+            "Mindest-Wochenruhe h",
+            min_value=12.0,
+            max_value=float(st.session_state.weekly_rest_hours),
+            value=min(float(st.session_state.reduced_weekly_rest_hours), float(st.session_state.weekly_rest_hours)),
+            step=1.0,
+            disabled=not bool(st.session_state.allow_reduced_weekly_rest),
+        )
+    with legal_profile_cols[2]:
+        st.session_state.weekly_average_max_hours = st.number_input(
+            "Ø Wochenarbeitszeit h",
+            min_value=1.0,
+            max_value=60.0,
+            value=float(st.session_state.weekly_average_max_hours),
+            step=0.5,
+            help="Grenze für die rollierende Durchrechnung.",
+        )
+        st.session_state.weekly_average_period_weeks = st.number_input(
+            "Durchrechnung Wochen",
+            min_value=1,
+            max_value=52,
+            value=int(st.session_state.weekly_average_period_weeks),
+            step=1,
         )
 
     st.session_state.plan_optimization_mode = st.selectbox(
@@ -6345,10 +8377,21 @@ with settings_tab:
             max(0.0, parse_hour_value(max_undertime_hours_text, float(st.session_state.max_undertime_hours))),
         )
 
-    rest_cols = st.columns(2)
+    st.markdown("**Ausgleich, Zeitausgleich und Nachtgutschrift**")
+    rest_cols = st.columns(3)
     with rest_cols[0]:
+        st.session_state.replacement_rest_kind = st.selectbox(
+            "Feiertags-/Sonntagsausgleich eintragen als",
+            options=REPLACEMENT_REST_KIND_OPTIONS,
+            index=REPLACEMENT_REST_KIND_OPTIONS.index(normalize_replacement_rest_kind(st.session_state.replacement_rest_kind)),
+            help=(
+                "Gesetzliche Ersatzruhe betrifft Arbeit in der wöchentlichen Ruhezeit. "
+                "Feiertagsarbeit ist meist Feiertagsentgelt; Zeitausgleich braucht eine Vereinbarung."
+            ),
+        )
+    with rest_cols[1]:
         st.session_state.replacement_rest_scope = st.selectbox(
-            "Ersatzruhetage",
+            "Ausgleichstage für",
             options=REPLACEMENT_REST_SCOPE_OPTIONS,
             index=REPLACEMENT_REST_SCOPE_OPTIONS.index(
                 normalize_replacement_rest_scope(
@@ -6364,20 +8407,69 @@ with settings_tab:
         st.session_state.replacement_rest_enabled = (
             st.session_state.replacement_rest_scope != "Keine Ersatzruhe"
         )
-    with rest_cols[1]:
+    with rest_cols[2]:
+        if st.session_state.replacement_rest_kind == "Gesetzliche Ersatzruhe":
+            st.session_state.compensatory_rest_counts_as_hours = True
         st.session_state.compensatory_rest_counts_as_hours = st.checkbox(
             "Ersatzruhe zählt als Dienststunden",
             value=bool(st.session_state.compensatory_rest_counts_as_hours),
-            disabled=not bool(st.session_state.replacement_rest_enabled),
-            help="Wenn aktiv, zählen eingetragene ER-Stunden zu den Ist-Stunden. Wenn aus, steht ER nur im Dienstplan.",
+            disabled=(
+                not bool(st.session_state.replacement_rest_enabled)
+                or st.session_state.replacement_rest_kind == "Gesetzliche Ersatzruhe"
+            ),
+            help="Gesetzliche Ersatzruhe zählt zur Arbeitszeit. Vertraglicher Zeitausgleich kann je Vertrag/KV anders geregelt sein.",
+        )
+    if (
+        st.session_state.replacement_rest_kind == "Gesetzliche Ersatzruhe"
+        and st.session_state.replacement_rest_scope == "Nur Feiertage"
+    ):
+        st.warning(
+            "Rechtlicher Hinweis: Reine Feiertagsarbeit löst in Österreich normalerweise Feiertagsentgelt aus. "
+            "Ein freier Ausgleichstag ist als Zeitausgleich nur mit passender Vereinbarung/KV sauber."
         )
     st.caption(
         "Für Turnusdienste ist das bewusst einstellbar: Verträge und Kollektivverträge können Feiertage, Sonntage oder Wochenenden unterschiedlich behandeln."
     )
+    night_credit_cols = st.columns(3)
+    with night_credit_cols[0]:
+        st.session_state.night_credit_mode = st.selectbox(
+            "Nachtgutschrift",
+            options=NIGHT_CREDIT_MODE_OPTIONS,
+            index=NIGHT_CREDIT_MODE_OPTIONS.index(normalize_night_credit_mode(st.session_state.night_credit_mode)),
+            help=(
+                "Zeitkonto: Zusatzgutschrift wird separat im Zeitkonto geführt und nicht als normale Ist-Stunde gezählt. "
+                "Dienststunden: Zusatzgutschrift zählt direkt in Ist h und +/- h. "
+                "Welche Variante richtig ist, hängt von Vertrag, KV oder Betriebsvereinbarung ab."
+            ),
+        )
+    with night_credit_cols[1]:
+        night_credit_text = st.text_input(
+            "Stunden pro Nachtdienst",
+            value=format_hour_value(st.session_state.night_credit_hours),
+            disabled=st.session_state.night_credit_mode == "Keine Nachtgutschrift",
+        )
+        st.session_state.night_credit_hours = max(
+            0.0,
+            parse_hour_value(night_credit_text, float(st.session_state.night_credit_hours)),
+        )
+    with night_credit_cols[2]:
+        st.session_state.time_account_usage = st.selectbox(
+            "Zeitkonto-Ausgleich",
+            options=TIME_ACCOUNT_USAGE_OPTIONS,
+            index=TIME_ACCOUNT_USAGE_OPTIONS.index(normalize_time_account_usage(st.session_state.time_account_usage)),
+            help=(
+                "Steuert, wie stark vorhandene Plus-/Minusstunden aus dem Start-Zeitkonto in der Planung abgebaut werden. "
+                "Vorrangig: möglichst bald ausgleichen. Sobald passend: mit guter Planqualität ausgleichen. "
+                "Nachrangig: nur ausgleichen, wenn genug Kapazität vorhanden ist."
+            ),
+        )
+    st.caption(
+        "Kurz erklärt: Zeitkonto führt die Nachtgutschrift separat weiter; Dienststunden rechnen sie direkt in die Stundenbilanz."
+    )
 
     st.markdown("**Urlaub**")
     st.caption("Urlaub zählt immer als bezahlte Dienstzeit und wird in den Ist-Stunden berücksichtigt.")
-    vacation_cols = st.columns(2)
+    vacation_cols = st.columns(3)
     with vacation_cols[0]:
         st.session_state.global_annual_vacation_weeks = st.number_input(
             "Standard-Urlaubswochen/Jahr",
@@ -6385,9 +8477,27 @@ with settings_tab:
             max_value=10.0,
             value=float(st.session_state.global_annual_vacation_weeks),
             step=0.5,
-            help="5 Wochen bedeuten: Urlaubsanspruch = 5 x individuelle Wochenstunden.",
+            help="Orientierung in Wochen. Die Stundenberechnung nutzt Urlaubstage und Stundenwert.",
         )
     with vacation_cols[1]:
+        st.session_state.global_annual_vacation_workdays = st.number_input(
+            "Standard-Urlaubstage/Jahr",
+            min_value=0.0,
+            max_value=60.0,
+            value=float(st.session_state.global_annual_vacation_workdays),
+            step=1.0,
+            help="Bei 5 Wochen und 5-Tage-Woche meist 25 Arbeitstage.",
+        )
+        global_vacation_day_hours_text = st.text_input(
+            "Standard-Stunden je Urlaubstag",
+            value=format_hour_value(st.session_state.global_vacation_day_hours),
+            help="0 bedeutet automatisch: individuelle Wochenstunden / 5.",
+        )
+        st.session_state.global_vacation_day_hours = max(
+            0.0,
+            parse_hour_value(global_vacation_day_hours_text, float(st.session_state.global_vacation_day_hours)),
+        )
+    with vacation_cols[2]:
         st.session_state.vacation_weekend_policy = st.selectbox(
             "Wochenende bei Urlaub",
             options=VACATION_WEEKEND_POLICY_OPTIONS,
@@ -6400,8 +8510,10 @@ with settings_tab:
     with vacation_apply_cols[0]:
         if st.button("Urlaubsstandard anwenden"):
             st.session_state.employees_df["Urlaubswochen/Jahr"] = float(st.session_state.global_annual_vacation_weeks)
+            st.session_state.employees_df["Urlaubstage/Jahr"] = float(st.session_state.global_annual_vacation_workdays)
+            st.session_state.employees_df["Urlaubstag h"] = float(st.session_state.global_vacation_day_hours)
             st.session_state.generated_plan = None
-            st.success("Standard-Urlaubswochen wurden übernommen.")
+            st.success("Urlaubsstandard wurde übernommen.")
 
     st.session_state.block_night_before_wish_free = st.checkbox(
         "Kein Nachtdienst vor Wunschfrei",
@@ -6411,7 +8523,36 @@ with settings_tab:
 
     st.divider()
     st.subheader("Österreich-Regeln für Turnusdienste")
-    st.caption("Kurzfassung als Planungsleitplanke, keine Rechtsberatung.")
+    st.caption("Kurzfassung als Planungsleitplanke, keine Rechtsberatung. KV, Betriebsvereinbarung und Berufsgruppe können strengere Regeln enthalten.")
+    with st.expander("Aktive Rechtsleitplanken", expanded=True):
+        st.caption(
+            "Diese Werte verwendet die App aktuell für Generierung und Regelprüfung. "
+            "Sie sollen die KV-/Vertragsprüfung nicht ersetzen, sondern sichtbar machen."
+        )
+        st.dataframe(
+            germanize_dataframe(
+                legal_guardrail_dataframe(
+                    legal_profile=st.session_state.legal_profile,
+                    daily_max_work_hours=float(st.session_state.daily_max_work_hours),
+                    weekly_average_max_hours=float(st.session_state.weekly_average_max_hours),
+                    weekly_average_period_weeks=int(st.session_state.weekly_average_period_weeks),
+                    weekly_rest_hours=float(st.session_state.weekly_rest_hours),
+                    reduced_weekly_rest_hours=float(st.session_state.reduced_weekly_rest_hours),
+                    allow_reduced_weekly_rest=bool(st.session_state.allow_reduced_weekly_rest),
+                    replacement_rest_kind=st.session_state.replacement_rest_kind,
+                    replacement_rest_scope=st.session_state.replacement_rest_scope,
+                    vacation_weekend_policy=st.session_state.vacation_weekend_policy,
+                    night_credit_mode=st.session_state.night_credit_mode,
+                    night_credit_hours=float(st.session_state.night_credit_hours),
+                    time_account_usage=st.session_state.time_account_usage,
+                    pause_policy=st.session_state.pause_policy,
+                    pause_threshold_hours=float(st.session_state.pause_threshold_hours),
+                    pause_duration_minutes=int(st.session_state.pause_duration_minutes),
+                )
+            ),
+            width="stretch",
+            hide_index=True,
+        )
     legal_cols = st.columns(4)
     legal_cols[0].checkbox("11 Stunden Ruhezeit", value=True, disabled=True)
     legal_cols[1].checkbox("48 Stunden Wochenarbeitszeit", value=True, disabled=True)
@@ -6421,9 +8562,11 @@ with settings_tab:
         pd.DataFrame(
             [
                 {"Regel": "11 Stunden Ruhezeit", "Umsetzung": "Zwischen zwei Diensten müssen immer mindestens 11 Stunden liegen."},
-                {"Regel": "48 Stunden Wochenarbeitszeit", "Umsetzung": "Wird weiterhin über die individuellen Mitarbeiter-Grenzen gesteuert."},
-                {"Regel": "36 Stunden Wochenruhe", "Umsetzung": "Max. Tage in Folge begrenzt lange Ketten."},
-                {"Regel": "Ersatzruhe", "Umsetzung": "Je Vertrag wählbar: keine, Feiertage, Sonntage+Feiertage oder Wochenenden+Feiertage."},
+                {"Regel": "48 Stunden Wochenarbeitszeit", "Umsetzung": "Rollierende Durchrechnung wird in der Regelprüfung über fixierte Monate geprüft."},
+                {"Regel": "36 Stunden Wochenruhe", "Umsetzung": "Zusammenhängende Ruhezeit wird mit Dienst-Uhrzeiten geprüft; Schichtverkürzung ist separat sichtbar."},
+                {"Regel": "Ersatzruhe/Zeitausgleich", "Umsetzung": "Gesetzliche Ersatzruhe gilt für Arbeit in der wöchentlichen Ruhezeit. Feiertags-Zeitausgleich ist je Vertrag/KV einstellbar."},
+                {"Regel": "Urlaub", "Umsetzung": "Anspruch je Person mit Stichtag, Urlaubstagen und Stundenwert pro Urlaubstag."},
+                {"Regel": "Ruhepause", "Umsetzung": "Pausen können als bezahlt enthalten oder als Abzug von den berechneten Dienststunden geführt werden."},
             ]
         )
     )
@@ -6464,6 +8607,7 @@ with settings_tab:
                 year_text, month_text = selected_saved_key.split("-")
                 st.session_state.selected_year = int(year_text)
                 st.session_state.selected_month = int(month_text)
+                st.session_state.manual_month_view = True
                 st.session_state.generated_plan = None
                 st.rerun()
         with plan_manage_cols[1]:
@@ -6505,55 +8649,55 @@ with planning_tab:
     if not planning_employees:
         st.error("Es gibt aktuell keine dienstplanrelevanten MitarbeiterInnen.")
         st.stop()
-    plan_left, plan_middle, plan_right = st.columns([0.25, 0.45, 0.3])
-    with plan_left:
-        selected_year_input = st.number_input(
-            "Jahr",
-            min_value=current_year - 1,
-            max_value=current_year + 3,
-            value=selected_year,
-            step=1,
-        )
-    with plan_middle:
-        selected_month_label = st.selectbox(
-            "Monat",
-            options=[f"{month:02d} - {MONTH_NAMES[month]}" for month in range(1, 13)],
-            index=selected_month - 1,
-        )
-    with plan_right:
-        planning_start_date = st.date_input(
-            "Planungsstart",
-            value=date(int(st.session_state.planning_start_year), int(st.session_state.planning_start_month), 1),
-            min_value=date(current_year - 1, 1, 1),
-            max_value=date(current_year + 3, 12, 31),
-            help="Ab diesem Monat darf gestartet werden. Danach immer nur weiter, wenn der Vormonat gespeichert und fixiert ist.",
-        )
-    new_selected_month = int(selected_month_label.split(" - ")[0])
-    new_start_year = int(planning_start_date.year)
-    new_start_month = int(planning_start_date.month)
-    if (
-        int(selected_year_input) != selected_year
-        or new_selected_month != selected_month
-        or new_start_year != int(st.session_state.planning_start_year)
-        or new_start_month != int(st.session_state.planning_start_month)
-    ):
-        st.session_state.selected_year = int(selected_year_input)
-        st.session_state.selected_month = new_selected_month
-        st.session_state.planning_start_year = new_start_year
-        st.session_state.planning_start_month = new_start_month
-        st.rerun()
-
-    st.caption(f"Geplant wird immer ein ganzer Monat: {MONTH_NAMES[selected_month]} {int(selected_year)}.")
+    current_next_year, current_next_month = next_open_plan_month(
+        st.session_state.saved_schedules,
+        int(st.session_state.planning_start_year),
+        int(st.session_state.planning_start_month),
+    )
+    saved_plan = st.session_state.saved_schedules.get(fixed_plan_key)
+    can_generate_selected, month_sequence_hint = can_generate_month(
+        st.session_state.saved_schedules,
+        int(selected_year),
+        selected_month,
+        int(st.session_state.planning_start_year),
+        int(st.session_state.planning_start_month),
+    )
+    selected_position = month_sequence_number(int(selected_year), selected_month)
+    start_position = month_sequence_number(
+        int(st.session_state.planning_start_year),
+        int(st.session_state.planning_start_month),
+    )
+    month_nav_cols = st.columns([0.42, 0.22, 0.18, 0.18])
+    with month_nav_cols[0]:
+        st.markdown(f"### {MONTH_NAMES[selected_month]} {int(selected_year)}")
+        st.caption("Geplant wird immer ein ganzer Monat.")
+    with month_nav_cols[1]:
+        if can_generate_selected:
+            st.caption(f"Status: {month_sequence_hint}")
+        else:
+            st.error(month_sequence_hint)
+    with month_nav_cols[2]:
+        if selected_position > start_position and st.button("Vorigen Monat anzeigen", width="stretch"):
+            previous_year, previous_month = shift_month(int(selected_year), selected_month, -1)
+            st.session_state.selected_year = previous_year
+            st.session_state.selected_month = previous_month
+            st.session_state.manual_month_view = True
+            st.session_state.generated_plan = None
+            st.rerun()
+    with month_nav_cols[3]:
+        if (
+            int(selected_year) != current_next_year
+            or selected_month != current_next_month
+        ) and st.button("Aktuellen Planungsmonat", width="stretch"):
+            st.session_state.selected_year = current_next_year
+            st.session_state.selected_month = current_next_month
+            st.session_state.manual_month_view = False
+            st.session_state.generated_plan = None
+            st.rerun()
 
     total_required = sum(daily_requirements.values())
     holiday_count = sum(1 for current_day in days if current_day in holidays)
     weekend_count = sum(1 for current_day in days if current_day.weekday() >= 5)
-
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("Kalendertage", len(days))
-    metric_cols[1].metric("Benötigte Dienste", total_required)
-    metric_cols[2].metric("Wochenendtage", weekend_count)
-    metric_cols[3].metric("Feiertage", holiday_count)
 
     staffing_summary, staffing_df = staffing_hours_overview(
         employees=planning_employees,
@@ -6576,33 +8720,40 @@ with planning_tab:
         ),
         vacation_counts_as_hours=True,
     )
-    hour_cols = st.columns(5)
-    hour_cols[0].metric("Personal-Sollstunden", format_display_hours(staffing_summary["personnel_target_hours"]))
-    hour_cols[1].metric("Benötigte Dienststunden", format_display_hours(staffing_summary["service_required_hours"]))
-    hour_cols[2].metric("Planbare Stunden", format_display_hours(staffing_summary["required_hours"]))
-    hour_cols[3].metric("Pflichtstunden", format_display_hours(staffing_summary["hard_required_hours"]))
-    hour_cols[4].metric("Restspielraum", format_display_hours(staffing_summary["hard_margin_hours"]))
-    fte_cols = st.columns(3)
-    fte_cols[0].metric("Planbedarf VZÄ", format_display_hours(staffing_summary["service_required_fte"]))
-    fte_cols[1].metric("Personal VZÄ", format_display_hours(staffing_summary["personnel_fte"]))
-    fte_cols[2].metric("Differenz Personal VZÄ", format_display_hours(staffing_summary["fte_difference"]))
-    st.caption(
-        "VZÄ = Vollzeitäquivalent. Berechnet mit "
-        f"{format_display_hours(staffing_summary['full_time_weekly_hours'])} h/Woche; "
-        "Differenz = vorhandenes Personal minus Planbedarf."
-    )
-    if staffing_summary.get("replacement_rest_credit_hours", 0) > 0:
+    with st.expander("Monatsübersicht anzeigen", expanded=False):
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Kalendertage", len(days))
+        metric_cols[1].metric("Benötigte Dienste", total_required)
+        metric_cols[2].metric("Samstage/Sonntage", weekend_count)
+        metric_cols[3].metric("Feiertage", holiday_count)
+        hour_cols = st.columns(5)
+        hour_cols[0].metric("Personal-Sollstunden", format_display_hours(staffing_summary["personnel_target_hours"]))
+        hour_cols[1].metric("Benötigte Dienststunden", format_display_hours(staffing_summary["service_required_hours"]))
+        hour_cols[2].metric("Planbare Stunden", format_display_hours(staffing_summary["required_hours"]))
+        hour_cols[3].metric("Pflichtstunden", format_display_hours(staffing_summary["hard_required_hours"]))
+        hour_cols[4].metric("Restspielraum", format_display_hours(staffing_summary["hard_margin_hours"]))
+        fte_cols = st.columns(3)
+        fte_cols[0].metric("Planbedarf VZÄ", format_display_hours(staffing_summary["service_required_fte"]))
+        fte_cols[1].metric("Personal VZÄ", format_display_hours(staffing_summary["personnel_fte"]))
+        fte_cols[2].metric("Differenz Personal VZÄ", format_display_hours(staffing_summary["fte_difference"]))
         st.caption(
-            "Planbare Stunden enthalten zusätzlich "
-            f"{format_display_hours(staffing_summary['replacement_rest_credit_hours'])} h Ersatzruhe, "
-            f"weil Ersatzruhe aktuell zu den Stunden zählt ({st.session_state.replacement_rest_scope})."
+            "VZÄ = Vollzeitäquivalent. Berechnet mit "
+            f"{format_display_hours(staffing_summary['full_time_weekly_hours'])} h/Woche; "
+            "Differenz = vorhandenes Personal minus Planbedarf."
         )
-    if staffing_summary.get("vacation_credit_hours", 0) > 0:
-        st.caption(
-            "Planbare Stunden enthalten zusätzlich "
-            f"{format_display_hours(staffing_summary['vacation_credit_hours'])} h Urlaub, "
-            "weil Urlaub immer zu den Stunden zählt."
-        )
+        if staffing_summary.get("replacement_rest_credit_hours", 0) > 0:
+            st.caption(
+                "Planbare Stunden enthalten zusätzlich "
+                f"{format_display_hours(staffing_summary['replacement_rest_credit_hours'])} h Ersatzruhe, "
+                f"weil der Ausgleich aktuell zu den Stunden zählt "
+                f"({st.session_state.replacement_rest_kind}, {st.session_state.replacement_rest_scope})."
+            )
+        if staffing_summary.get("vacation_credit_hours", 0) > 0:
+            st.caption(
+                "Planbare Stunden enthalten zusätzlich "
+                f"{format_display_hours(staffing_summary['vacation_credit_hours'])} h Urlaub, "
+                "weil Urlaub immer zu den Stunden zählt."
+            )
     previous_assignments_preview = previous_assignments_for_generation(
         st.session_state.saved_schedules,
         st.session_state.employees_df,
@@ -6626,6 +8777,14 @@ with planning_tab:
         vacation_weekend_policy=st.session_state.vacation_weekend_policy,
         previous_assignments=previous_assignments_preview,
         block_night_before_wish_free=bool(st.session_state.block_night_before_wish_free),
+        legal_profile=st.session_state.legal_profile,
+        daily_max_work_hours=float(st.session_state.daily_max_work_hours),
+        weekly_average_max_hours=float(st.session_state.weekly_average_max_hours),
+        weekly_average_period_weeks=int(st.session_state.weekly_average_period_weeks),
+        weekly_rest_hours=float(st.session_state.weekly_rest_hours),
+        reduced_weekly_rest_hours=float(st.session_state.reduced_weekly_rest_hours),
+        allow_reduced_weekly_rest=bool(st.session_state.allow_reduced_weekly_rest),
+        shift_minutes_by_code=shift_minutes_by_code,
     )
     service_diagnostics_df = service_level_diagnostics(
         employees=planning_employees,
@@ -6645,15 +8804,28 @@ with planning_tab:
     warning_count = (
         int((preflight_df["Status"] == "Warnung").sum()) if not preflight_df.empty else 0
     ) + len(service_diagnostics_df)
-    with st.expander(
-        f"Machbarkeitsprüfung vor dem Generieren ({blocker_count} Blocker, {warning_count} Warnungen)",
-        expanded=blocker_count > 0,
-    ):
-        st.caption("Diese Prüfung erkennt die häufigsten rechnerischen Gründe, warum ein Dienstplan nicht möglich ist.")
-        st.dataframe(germanize_dataframe(preflight_df), width="stretch", hide_index=True)
-        if not service_diagnostics_df.empty:
-            st.markdown("**Engpässe je Tag und Dienstform**")
-            st.dataframe(germanize_dataframe(service_diagnostics_df), width="stretch", hide_index=True)
+    scenario_df = scenario_readiness_dataframe(
+        preflight_df=preflight_df,
+        service_diagnostics_df=service_diagnostics_df,
+        staffing_summary=staffing_summary,
+        previous_assignments=previous_assignments_preview,
+        employees=planning_employees,
+        days=days,
+        holidays=holidays,
+        vacation_weekend_policy=st.session_state.vacation_weekend_policy,
+    )
+    if blocker_count > 0 or warning_count > 0:
+        with st.expander(
+            f"Machbarkeitsprüfung ({blocker_count} Blocker, {warning_count} Warnungen)",
+            expanded=True,
+        ):
+            st.caption("Diese Prüfung erkennt die häufigsten rechnerischen Gründe, warum ein Dienstplan nicht möglich ist.")
+            st.dataframe(germanize_dataframe(preflight_df), width="stretch", hide_index=True)
+            if not service_diagnostics_df.empty:
+                st.markdown("**Engpässe je Tag und Dienstform**")
+                st.dataframe(germanize_dataframe(service_diagnostics_df), width="stretch", hide_index=True)
+    else:
+        st.caption("Machbarkeit: keine Blocker oder Warnungen.")
     if staffing_summary["too_many_personnel_hours"] > 0:
         st.error(
             "Achtung: Es sind mehr Mindest-Personalstunden vorhanden als Dienststunden geplant sind. "
@@ -6668,38 +8840,20 @@ with planning_tab:
             f"Es fehlen etwa {format_display_hours(staffing_summary['too_few_personnel_hours'])} h. "
             "Erhöhe die Überstunden-Grenze, plane mehr Personal ein oder reduziere Pflichtdienste."
         )
-    with st.expander("Stunden nach Dienstform-Priorität", expanded=False):
-        st.caption("Prio 1 muss besetzt werden. Prio 2 und 3 dürfen bei Engpässen offen bleiben.")
-        render_static_table(staffing_df)
-
-    st.caption(
-        "Globale Regeln wie Überstunden und Ersatzruhe findest du im Reiter Einstellungen. Ob Dienste offen bleiben dürfen, steuert die Priorität in den Dienstformen."
-    )
-    st.caption(
-        f"Aktuelles Optimierungsziel: {normalize_plan_optimization_mode(st.session_state.plan_optimization_mode)}."
-    )
-    st.caption(
-        "Für gleiche Eingaben wird der beste bekannte Entwurf stabil wiederverwendet."
-    )
-
-    saved_plan = st.session_state.saved_schedules.get(fixed_plan_key)
     if saved_plan:
         st.info("Für diesen Monat gibt es bereits einen gespeicherten, fixierten Dienstplan.")
-    can_generate_selected, month_sequence_hint = can_generate_month(
-        st.session_state.saved_schedules,
-        int(selected_year),
-        selected_month,
-        int(st.session_state.planning_start_year),
-        int(st.session_state.planning_start_month),
-    )
-    if can_generate_selected:
-        st.info(month_sequence_hint)
-    else:
-        st.error(month_sequence_hint)
     if st.session_state.get("best_plan_cache_loaded", False):
         st.success("Für diese Einstellungen wurde der bisher beste Entwurf aus dieser Sitzung geladen.")
         st.session_state.best_plan_cache_loaded = False
-
+    workflow_df = planning_workflow_dataframe(
+        employee_count=len(planning_employees),
+        employee_warning_count=len(employee_warning_dataframe(employees)),
+        blocker_count=blocker_count,
+        warning_count=warning_count,
+        generated_plan_exists=bool(st.session_state.get("generated_plan")),
+        saved_plan_exists=bool(saved_plan),
+        can_generate=bool(can_generate_selected),
+    )
     selected_optimization_mode = normalize_plan_optimization_mode(st.session_state.plan_optimization_mode)
     selected_calculation_mode = DEFAULT_CALCULATION_MODE
     previous_assignments_current = previous_assignments_for_generation(
@@ -6718,6 +8872,7 @@ with planning_tab:
         "max_undertime_percent": float(st.session_state.max_undertime_percent),
         "max_undertime_hours": float(st.session_state.max_undertime_hours),
         "replacement_rest_enabled": bool(st.session_state.replacement_rest_enabled),
+        "replacement_rest_kind": st.session_state.replacement_rest_kind,
         "replacement_rest_scope": st.session_state.replacement_rest_scope,
         "compensatory_rest_counts_as_hours": bool(st.session_state.compensatory_rest_counts_as_hours),
         "block_night_before_wish_free": bool(st.session_state.block_night_before_wish_free),
@@ -6728,7 +8883,21 @@ with planning_tab:
         "planning_start_month": int(st.session_state.planning_start_month),
         "vacation_counts_as_hours": True,
         "vacation_weekend_policy": st.session_state.vacation_weekend_policy,
+        "legal_profile": st.session_state.legal_profile,
+        "daily_max_work_hours": float(st.session_state.daily_max_work_hours),
+        "weekly_average_max_hours": float(st.session_state.weekly_average_max_hours),
+        "weekly_average_period_weeks": int(st.session_state.weekly_average_period_weeks),
+        "weekly_rest_hours": float(st.session_state.weekly_rest_hours),
+        "reduced_weekly_rest_hours": float(st.session_state.reduced_weekly_rest_hours),
+        "allow_reduced_weekly_rest": bool(st.session_state.allow_reduced_weekly_rest),
+        "pause_policy": st.session_state.pause_policy,
+        "pause_threshold_hours": float(st.session_state.pause_threshold_hours),
+        "pause_duration_minutes": int(st.session_state.pause_duration_minutes),
+        "time_account_usage": st.session_state.time_account_usage,
     }
+    if st.session_state.night_credit_mode != "Keine Nachtgutschrift":
+        generation_settings["night_credit_mode"] = st.session_state.night_credit_mode
+        generation_settings["night_credit_hours"] = float(st.session_state.night_credit_hours)
     current_cache_key = generation_cache_key(
         year=int(selected_year),
         month=selected_month,
@@ -6769,6 +8938,13 @@ with planning_tab:
         "max_undertime_percent": float(st.session_state.max_undertime_percent),
         "max_undertime_hours": float(st.session_state.max_undertime_hours),
         "block_night_before_wish_free": bool(st.session_state.block_night_before_wish_free),
+        "daily_max_work_hours": float(st.session_state.daily_max_work_hours),
+        "weekly_rest_hours": float(st.session_state.weekly_rest_hours),
+        "reduced_weekly_rest_hours": float(st.session_state.reduced_weekly_rest_hours),
+        "allow_reduced_weekly_rest": bool(st.session_state.allow_reduced_weekly_rest),
+        "night_credit_mode": st.session_state.night_credit_mode,
+        "night_credit_hours": float(st.session_state.night_credit_hours),
+        "time_account_usage": st.session_state.time_account_usage,
     }
     if st.session_state.get("last_improvement_message"):
         st.info(st.session_state.last_improvement_message)
@@ -6801,6 +8977,7 @@ with planning_tab:
             "max_undertime_percent": float(st.session_state.max_undertime_percent),
             "max_undertime_hours": float(st.session_state.max_undertime_hours),
             "replacement_rest_enabled": bool(st.session_state.replacement_rest_enabled),
+            "replacement_rest_kind": st.session_state.replacement_rest_kind,
             "replacement_rest_scope": st.session_state.replacement_rest_scope,
             "compensatory_rest_counts_as_hours": bool(st.session_state.compensatory_rest_counts_as_hours),
             "block_night_before_wish_free": bool(st.session_state.block_night_before_wish_free),
@@ -6811,7 +8988,21 @@ with planning_tab:
             "planning_start_month": int(st.session_state.planning_start_month),
             "vacation_counts_as_hours": True,
             "vacation_weekend_policy": st.session_state.vacation_weekend_policy,
+            "legal_profile": st.session_state.legal_profile,
+            "daily_max_work_hours": float(st.session_state.daily_max_work_hours),
+            "weekly_average_max_hours": float(st.session_state.weekly_average_max_hours),
+            "weekly_average_period_weeks": int(st.session_state.weekly_average_period_weeks),
+            "weekly_rest_hours": float(st.session_state.weekly_rest_hours),
+            "reduced_weekly_rest_hours": float(st.session_state.reduced_weekly_rest_hours),
+            "allow_reduced_weekly_rest": bool(st.session_state.allow_reduced_weekly_rest),
+            "pause_policy": st.session_state.pause_policy,
+            "pause_threshold_hours": float(st.session_state.pause_threshold_hours),
+            "pause_duration_minutes": int(st.session_state.pause_duration_minutes),
+            "time_account_usage": st.session_state.time_account_usage,
         }
+        if st.session_state.night_credit_mode != "Keine Nachtgutschrift":
+            generation_settings["night_credit_mode"] = st.session_state.night_credit_mode
+            generation_settings["night_credit_hours"] = float(st.session_state.night_credit_hours)
         current_cache_key = generation_cache_key(
             year=int(selected_year),
             month=selected_month,
@@ -6829,8 +9020,127 @@ with planning_tab:
         )
         base_seed = stable_seed_from_key(current_cache_key)
         cached_plan = st.session_state.best_plan_cache.get(current_cache_key)
+        cached_plan_candidate = None
         if cached_plan:
-            st.session_state.generated_plan = copy.deepcopy(cached_plan)
+            cached_plan_copy = copy.deepcopy(cached_plan)
+            if st.session_state.night_credit_mode != "Keine Nachtgutschrift":
+                cached_plan_copy["metrics"] = apply_night_credit_hours(
+                    cached_plan_copy.get("schedule", {}),
+                    cached_plan_copy.get("metrics", {}),
+                    night_shifts,
+                    float(st.session_state.night_credit_hours),
+                    counts_as_hours=st.session_state.night_credit_mode == "Nachtgutschrift als Dienststunden",
+                )
+                cached_plan_copy["night_credit_mode"] = st.session_state.night_credit_mode
+                cached_plan_copy["night_credit_hours"] = float(st.session_state.night_credit_hours)
+            cached_plan_candidate = cached_plan_copy
+        compatibility_settings = {
+            "replacement_rest_enabled": bool(st.session_state.replacement_rest_enabled),
+            "replacement_rest_scope": st.session_state.replacement_rest_scope,
+            "counts_rest_as_hours": (
+                bool(st.session_state.replacement_rest_enabled)
+                and bool(st.session_state.compensatory_rest_counts_as_hours)
+            ),
+            "vacation_weekend_policy": st.session_state.vacation_weekend_policy,
+            "max_overtime_percent": float(st.session_state.max_overtime_percent),
+            "max_overtime_hours": float(st.session_state.max_overtime_hours),
+            "max_undertime_percent": float(st.session_state.max_undertime_percent),
+            "max_undertime_hours": float(st.session_state.max_undertime_hours),
+            "block_night_before_wish_free": bool(st.session_state.block_night_before_wish_free),
+            "daily_max_work_hours": float(st.session_state.daily_max_work_hours),
+            "weekly_average_max_hours": float(st.session_state.weekly_average_max_hours),
+            "weekly_average_period_weeks": int(st.session_state.weekly_average_period_weeks),
+            "weekly_rest_hours": float(st.session_state.weekly_rest_hours),
+            "reduced_weekly_rest_hours": float(st.session_state.reduced_weekly_rest_hours),
+            "allow_reduced_weekly_rest": bool(st.session_state.allow_reduced_weekly_rest),
+            "pause_policy": st.session_state.pause_policy,
+            "pause_threshold_hours": float(st.session_state.pause_threshold_hours),
+            "pause_duration_minutes": int(st.session_state.pause_duration_minutes),
+            "night_credit_mode": st.session_state.night_credit_mode,
+            "night_credit_hours": float(st.session_state.night_credit_hours),
+            "time_account_usage": st.session_state.time_account_usage,
+            "plan_optimization_mode": selected_optimization_mode,
+            "calculation_mode": selected_calculation_mode,
+        }
+        employee_name_set = {employee.name for employee in planning_employees}
+        compatible_cached_plan = None
+        for candidate in st.session_state.best_plan_cache.values():
+            if not isinstance(candidate, dict) or candidate.get("key") != fixed_plan_key:
+                continue
+            candidate_schedule = candidate.get("schedule", {})
+            if set(candidate_schedule.keys()) != employee_name_set:
+                continue
+            if any(len(assignments) != len(days) for assignments in candidate_schedule.values()):
+                continue
+            if any(candidate.get(key) != value for key, value in compatibility_settings.items()):
+                continue
+            candidate_copy = copy.deepcopy(candidate)
+            candidate_rule_checks = validate_schedule_rules(
+                schedule=candidate_copy.get("schedule", {}),
+                metrics=candidate_copy.get("metrics", {}),
+                employees=planning_employees,
+                days=days,
+                night_shifts=night_shifts,
+                shifts=shifts,
+                holidays=holidays,
+                daily_requirements=daily_requirements,
+                shift_df=st.session_state.shifts_df,
+                shift_minutes_by_code=shift_minutes_by_code,
+                shift_time_by_code=shift_time_by_code,
+                max_overtime_percent=float(st.session_state.max_overtime_percent),
+                max_overtime_hours=float(st.session_state.max_overtime_hours),
+                max_undertime_percent=float(st.session_state.max_undertime_percent),
+                max_undertime_hours=float(st.session_state.max_undertime_hours),
+                block_night_before_wish_free=bool(st.session_state.block_night_before_wish_free),
+                previous_assignments=previous_assignments_current,
+                open_shift_codes=open_shift_codes,
+                shift_priority_by_code=shift_priority_by_code,
+                vacation_weekend_policy=st.session_state.vacation_weekend_policy,
+                legal_profile=st.session_state.legal_profile,
+                daily_max_work_hours=float(st.session_state.daily_max_work_hours),
+                weekly_average_max_hours=float(st.session_state.weekly_average_max_hours),
+                weekly_average_period_weeks=int(st.session_state.weekly_average_period_weeks),
+                weekly_rest_hours=float(st.session_state.weekly_rest_hours),
+                reduced_weekly_rest_hours=float(st.session_state.reduced_weekly_rest_hours),
+                allow_reduced_weekly_rest=bool(st.session_state.allow_reduced_weekly_rest),
+                saved_schedules=st.session_state.saved_schedules,
+            )
+            if any(check.get("Status") == "Fehler" for check in candidate_rule_checks):
+                continue
+            candidate_copy["rule_checks"] = candidate_rule_checks
+            if st.session_state.night_credit_mode != "Keine Nachtgutschrift":
+                candidate_copy["metrics"] = apply_night_credit_hours(
+                    candidate_copy.get("schedule", {}),
+                    candidate_copy.get("metrics", {}),
+                    night_shifts,
+                    float(st.session_state.night_credit_hours),
+                    counts_as_hours=st.session_state.night_credit_mode == "Nachtgutschrift als Dienststunden",
+                )
+                candidate_copy["night_credit_mode"] = st.session_state.night_credit_mode
+                candidate_copy["night_credit_hours"] = float(st.session_state.night_credit_hours)
+            compatible_cached_plan = better_plan_payload(
+                compatible_cached_plan,
+                candidate_copy,
+                days=days,
+                daily_requirements=daily_requirements,
+                shift_df=st.session_state.shifts_df,
+                open_shift_codes=open_shift_codes,
+                shift_priority_by_code=shift_priority_by_code,
+            )
+        best_cached_candidate = better_plan_payload(
+            cached_plan_candidate,
+            compatible_cached_plan,
+            days=days,
+            daily_requirements=daily_requirements,
+            shift_df=st.session_state.shifts_df,
+            open_shift_codes=open_shift_codes,
+            shift_priority_by_code=shift_priority_by_code,
+        )
+        if best_cached_candidate:
+            best_cached_candidate["cache_key"] = current_cache_key
+            st.session_state.best_plan_cache[current_cache_key] = best_cached_candidate
+            save_best_plan_cache(st.session_state.best_plan_cache)
+            st.session_state.generated_plan = copy.deepcopy(best_cached_candidate)
             st.session_state.generated_plan["key"] = fixed_plan_key
             st.session_state.best_plan_cache_loaded = True
             st.rerun()
@@ -6864,6 +9174,8 @@ with planning_tab:
         progress_text.info("Zuerst wird ein möglichst vollständig besetzter Plan gesucht...")
         progress_bar.progress(40)
         preview_slot = st.empty()
+        generation_started_at = datetime.now()
+        generation_wall_time_limit_seconds = 240
         render_generation_preview(
             preview_slot,
             "Noch kein gültiger Plan gefunden. Die Optimierung startet gerade.",
@@ -6901,6 +9213,13 @@ with planning_tab:
                 "max_undertime_percent": float(st.session_state.max_undertime_percent),
                 "max_undertime_hours": float(st.session_state.max_undertime_hours),
                 "block_night_before_wish_free": bool(st.session_state.block_night_before_wish_free),
+                "daily_max_work_hours": float(st.session_state.daily_max_work_hours),
+                "weekly_rest_hours": float(st.session_state.weekly_rest_hours),
+                "reduced_weekly_rest_hours": float(st.session_state.reduced_weekly_rest_hours),
+                "allow_reduced_weekly_rest": bool(st.session_state.allow_reduced_weekly_rest),
+                "night_credit_mode": st.session_state.night_credit_mode,
+                "night_credit_hours": float(st.session_state.night_credit_hours),
+                "time_account_usage": st.session_state.time_account_usage,
             }
             holiday_heavy = holiday_pressure_level(days, holidays) >= 6
             defer_replacement_rest = False
@@ -6971,6 +9290,12 @@ with planning_tab:
                     best_shortage_penalty,
                 )
                 for variant_index, (variant_label, variant_strategy, seed_offset) in enumerate(variant_profiles, start=1):
+                    if (datetime.now() - generation_started_at).total_seconds() > generation_wall_time_limit_seconds:
+                        optimization_note = (
+                            "Die automatische Optimierung wurde nach dem Zeitfenster beendet. "
+                            "Der beste bis dahin gefundene gültige Plan wird angezeigt und kann mit 'Plan weiter optimieren' verfeinert werden."
+                        )
+                        break
                     progress_text.info(f"Variante {variant_index}: {variant_label}...")
                     progress_bar.progress(
                         min(88, 65 + int(20 * variant_index / max(1, len(variant_profiles))))
@@ -7085,6 +9410,12 @@ with planning_tab:
                     if holiday_heavy:
                         extra_profiles.append(("Feiertage vertiefen", "Feiertage robust", 523, 55))
                     for extra_index, (extra_label, extra_strategy, seed_offset, time_budget) in enumerate(extra_profiles, start=1):
+                        if (datetime.now() - generation_started_at).total_seconds() > generation_wall_time_limit_seconds:
+                            optimization_note = (
+                                "Die automatische Optimierung wurde nach dem Zeitfenster beendet. "
+                                "Der beste bis dahin gefundene gültige Plan wird angezeigt und kann mit 'Plan weiter optimieren' verfeinert werden."
+                            )
+                            break
                         progress_bar.progress(min(94, 88 + extra_index))
                         progress_text.info(f"Zusatzlauf {extra_index}: {extra_label}...")
                         extra_status, extra_schedule, extra_metrics = solve_schedule(
@@ -7184,7 +9515,7 @@ with planning_tab:
             if not service_diagnostics_df.empty:
                 st.markdown("**Konkrete Engpässe je Tag und Dienstform**")
                 st.dataframe(germanize_dataframe(service_diagnostics_df), width="stretch", hide_index=True)
-            for reason in diagnose_no_plan(
+            diagnosis_reasons = diagnose_no_plan(
                 employees=planning_employees,
                 days=days,
                 holidays=holidays,
@@ -7203,7 +9534,16 @@ with planning_tab:
                     bool(st.session_state.replacement_rest_enabled)
                     and bool(st.session_state.compensatory_rest_counts_as_hours)
                 ),
-            ):
+            )
+            next_steps_df = failure_next_steps_dataframe(
+                issue_df,
+                service_diagnostics_df,
+                diagnosis_reasons,
+            )
+            if not next_steps_df.empty:
+                st.markdown("**Was du als Erstes tun solltest**")
+                st.dataframe(germanize_dataframe(next_steps_df), width="stretch", hide_index=True)
+            for reason in diagnosis_reasons:
                 if reason.startswith("Hauptgrund:"):
                     st.error(reason)
                 else:
@@ -7229,6 +9569,14 @@ with planning_tab:
                 )
             else:
                 open_rest_notes = []
+            if st.session_state.night_credit_mode != "Keine Nachtgutschrift":
+                metrics = apply_night_credit_hours(
+                    schedule,
+                    metrics,
+                    night_shifts,
+                    float(st.session_state.night_credit_hours),
+                    counts_as_hours=st.session_state.night_credit_mode == "Nachtgutschrift als Dienststunden",
+                )
             rule_checks = validate_schedule_rules(
                 schedule=schedule,
                 metrics=metrics,
@@ -7250,6 +9598,14 @@ with planning_tab:
                 open_shift_codes=open_shift_codes,
                 shift_priority_by_code=shift_priority_by_code,
                 vacation_weekend_policy=st.session_state.vacation_weekend_policy,
+                legal_profile=st.session_state.legal_profile,
+                daily_max_work_hours=float(st.session_state.daily_max_work_hours),
+                weekly_average_max_hours=float(st.session_state.weekly_average_max_hours),
+                weekly_average_period_weeks=int(st.session_state.weekly_average_period_weeks),
+                weekly_rest_hours=float(st.session_state.weekly_rest_hours),
+                reduced_weekly_rest_hours=float(st.session_state.reduced_weekly_rest_hours),
+                allow_reduced_weekly_rest=bool(st.session_state.allow_reduced_weekly_rest),
+                saved_schedules=st.session_state.saved_schedules,
             )
             preview_slot.empty()
             final_quality_score = plan_quality_score(
@@ -7272,11 +9628,14 @@ with planning_tab:
                 "open_rest_notes": open_rest_notes,
                 "rule_checks": rule_checks,
                 "replacement_rest_enabled": bool(st.session_state.replacement_rest_enabled),
+                "replacement_rest_kind": st.session_state.replacement_rest_kind,
                 "replacement_rest_scope": st.session_state.replacement_rest_scope,
                 "counts_rest_as_hours": (
                     bool(st.session_state.replacement_rest_enabled)
                     and bool(st.session_state.compensatory_rest_counts_as_hours)
                 ),
+                "night_credit_mode": st.session_state.night_credit_mode,
+                "night_credit_hours": float(st.session_state.night_credit_hours),
                 "vacation_counts_as_hours": True,
                 "vacation_weekend_policy": st.session_state.vacation_weekend_policy,
                 "max_overtime_percent": float(st.session_state.max_overtime_percent),
@@ -7284,6 +9643,17 @@ with planning_tab:
                 "max_undertime_percent": float(st.session_state.max_undertime_percent),
                 "max_undertime_hours": float(st.session_state.max_undertime_hours),
                 "block_night_before_wish_free": bool(st.session_state.block_night_before_wish_free),
+                "legal_profile": st.session_state.legal_profile,
+                "daily_max_work_hours": float(st.session_state.daily_max_work_hours),
+                "weekly_average_max_hours": float(st.session_state.weekly_average_max_hours),
+                "weekly_average_period_weeks": int(st.session_state.weekly_average_period_weeks),
+                "weekly_rest_hours": float(st.session_state.weekly_rest_hours),
+                "reduced_weekly_rest_hours": float(st.session_state.reduced_weekly_rest_hours),
+                "allow_reduced_weekly_rest": bool(st.session_state.allow_reduced_weekly_rest),
+                "pause_policy": st.session_state.pause_policy,
+                "pause_threshold_hours": float(st.session_state.pause_threshold_hours),
+                "pause_duration_minutes": int(st.session_state.pause_duration_minutes),
+                "time_account_usage": st.session_state.time_account_usage,
                 "open_shift_codes": open_shift_codes,
                 "shifts": shifts,
                 "night_shifts": night_shifts,
@@ -7356,11 +9726,23 @@ with planning_tab:
             improve_summary_cols[3].metric("Max. Abweichung", f"{format_display_hours(stats['deviation'])} h")
             improve_summary_cols[4].metric("Optimalität", str(stats["status"]))
 
+        improvement_progress_slot = st.empty()
+        improvement_text_slot = st.empty()
+        improvement_preview_slot = st.empty()
         save_left, improve_middle, save_right = st.columns([0.36, 0.28, 0.36])
         with save_left:
             if st.button("Plan speichern und fixieren", type="primary", width="stretch", disabled=pending_rule_errors > 0):
                 st.session_state.saved_schedules[fixed_plan_key] = pending_plan
                 save_saved_schedules(st.session_state.saved_schedules)
+                next_year_after_save, next_month_after_save = next_open_plan_month(
+                    st.session_state.saved_schedules,
+                    int(st.session_state.planning_start_year),
+                    int(st.session_state.planning_start_month),
+                )
+                st.session_state.selected_year = next_year_after_save
+                st.session_state.selected_month = next_month_after_save
+                st.session_state.manual_month_view = False
+                st.session_state.generated_plan = None
                 st.success("Dienstplan gespeichert. Er ist jetzt für die MitarbeiterInnen fix.")
                 st.rerun()
         with improve_middle:
@@ -7404,24 +9786,33 @@ with planning_tab:
                     selected_optimization_mode,
                     best_shortage_penalty,
                 )
-                improvement_progress = st.progress(0)
-                improvement_text = st.empty()
-                improvement_preview = st.empty()
+                improvement_progress = improvement_progress_slot.progress(0)
+                improvement_text = improvement_text_slot
+                improvement_preview = improvement_preview_slot
                 holiday_heavy = holiday_pressure_level(days, holidays) >= 6
                 improvement_profiles = plan_improvement_profiles(
                     selected_optimization_mode,
                     holiday_heavy=holiday_heavy,
                 )
                 improved = False
+                improvement_timed_out = False
+                improvement_started_at = datetime.now()
+                improvement_wall_time_limit_seconds = 180
                 with st.spinner("Plan wird weiter optimiert..."):
                     for improvement_index, (label, strategy, seed_offset, time_budget) in enumerate(improvement_profiles, start=1):
+                        remaining_seconds = improvement_wall_time_limit_seconds - (
+                            datetime.now() - improvement_started_at
+                        ).total_seconds()
+                        if remaining_seconds <= 5:
+                            improvement_timed_out = True
+                            break
                         improvement_text.info(f"Verbesserungslauf {improvement_index}: {label}...")
                         improvement_progress.progress(
                             min(95, int(100 * improvement_index / max(1, len(improvement_profiles))))
                         )
                         candidate_status, candidate_schedule, candidate_metrics = solve_schedule(
                             **base_solver_args,
-                            max_time_seconds=time_budget,
+                            max_time_seconds=max(5, min(int(time_budget), int(remaining_seconds))),
                             optimize_for_fairness=True,
                             plan_strategy=strategy,
                             random_seed=base_seed + seed_offset + int(st.session_state.get("generation_run_number", 0)) * 997,
@@ -7446,6 +9837,14 @@ with planning_tab:
                             )
                         else:
                             candidate_open_rest_notes = []
+                        if st.session_state.night_credit_mode != "Keine Nachtgutschrift":
+                            candidate_metrics = apply_night_credit_hours(
+                                candidate_schedule,
+                                candidate_metrics,
+                                night_shifts,
+                                float(st.session_state.night_credit_hours),
+                                counts_as_hours=st.session_state.night_credit_mode == "Nachtgutschrift als Dienststunden",
+                            )
                         candidate_rule_checks = validate_schedule_rules(
                             schedule=candidate_schedule,
                             metrics=candidate_metrics,
@@ -7467,6 +9866,14 @@ with planning_tab:
                             open_shift_codes=open_shift_codes,
                             shift_priority_by_code=shift_priority_by_code,
                             vacation_weekend_policy=st.session_state.vacation_weekend_policy,
+                            legal_profile=st.session_state.legal_profile,
+                            daily_max_work_hours=float(st.session_state.daily_max_work_hours),
+                            weekly_average_max_hours=float(st.session_state.weekly_average_max_hours),
+                            weekly_average_period_weeks=int(st.session_state.weekly_average_period_weeks),
+                            weekly_rest_hours=float(st.session_state.weekly_rest_hours),
+                            reduced_weekly_rest_hours=float(st.session_state.reduced_weekly_rest_hours),
+                            allow_reduced_weekly_rest=bool(st.session_state.allow_reduced_weekly_rest),
+                            saved_schedules=st.session_state.saved_schedules,
                         )
                         if any(check.get("Status") == "Fehler" for check in candidate_rule_checks):
                             continue
@@ -7495,6 +9902,8 @@ with planning_tab:
                                 bool(st.session_state.replacement_rest_enabled)
                                 and bool(st.session_state.compensatory_rest_counts_as_hours)
                             ),
+                            "night_credit_mode": st.session_state.night_credit_mode,
+                            "night_credit_hours": float(st.session_state.night_credit_hours),
                             "vacation_counts_as_hours": True,
                             "vacation_weekend_policy": st.session_state.vacation_weekend_policy,
                             "max_overtime_percent": float(st.session_state.max_overtime_percent),
@@ -7502,6 +9911,10 @@ with planning_tab:
                             "max_undertime_percent": float(st.session_state.max_undertime_percent),
                             "max_undertime_hours": float(st.session_state.max_undertime_hours),
                             "block_night_before_wish_free": bool(st.session_state.block_night_before_wish_free),
+                            "pause_policy": st.session_state.pause_policy,
+                            "pause_threshold_hours": float(st.session_state.pause_threshold_hours),
+                            "pause_duration_minutes": int(st.session_state.pause_duration_minutes),
+                            "time_account_usage": st.session_state.time_account_usage,
                             "open_shift_codes": open_shift_codes,
                             "shifts": shifts,
                             "night_shifts": night_shifts,
@@ -7583,6 +9996,10 @@ with planning_tab:
                         "Weiter optimiert, aber keine bessere Variante gefunden. "
                         "Der bisherige Plan wurde unverändert behalten."
                     )
+                if improvement_timed_out:
+                    st.session_state.last_improvement_message += (
+                        " Das Zeitfenster wurde ausgeschöpft; der beste bisherige Plan bleibt erhalten."
+                    )
                 st.rerun()
         with save_right:
             if st.button("Entwurf verwerfen", width="stretch"):
@@ -7603,6 +10020,11 @@ with planning_tab:
             shift_priority_by_code=shift_priority_by_code,
             solver_status=pending_plan.get("status"),
             calculation_mode=pending_plan.get("calculation_mode"),
+            shifts=shifts,
+            night_shifts=night_shifts,
+            shift_minutes_by_code=shift_minutes_by_code,
+            shift_time_by_code=shift_time_by_code,
+            previous_assignments=previous_assignments_current,
         )
     elif saved_plan:
         render_plan_result(
@@ -7620,8 +10042,69 @@ with planning_tab:
             shift_priority_by_code=shift_priority_by_code,
             solver_status=saved_plan.get("status"),
             calculation_mode=saved_plan.get("calculation_mode"),
+            shifts=shifts,
+            night_shifts=night_shifts,
+            shift_minutes_by_code=shift_minutes_by_code,
+            shift_time_by_code=shift_time_by_code,
+            previous_assignments=previous_assignments_current,
         )
     else:
-        st.info("Wähle Monat und Ressourcen, prüfe die Mitarbeiter und klicke dann auf 'Dienstplan generieren'.")
+        st.info("Prüfe bei Bedarf die Einstellungen und klicke dann auf 'Dienstplan generieren'.")
+
+with help_tab:
+    st.subheader("Hilfe & Prüflogik")
+    st.caption("Hier liegen die Erklärungen und Vorprüfungen, damit der Dienstplan-Tab als ruhige Arbeitsfläche bleibt.")
+
+    with st.expander("Feste Prüfszenarien und Ampeln", expanded=True):
+        st.caption(
+            "Diese drei Prüfszenarien bewerten die aktuelle Eingabe vor dem Generieren. "
+            "Sie ersetzen nicht die Solver-Prüfung, zeigen aber früh, wo es wahrscheinlich eng wird."
+        )
+        st.dataframe(germanize_dataframe(scenario_df), width="stretch", hide_index=True)
+
+    with st.expander("Planungsablauf", expanded=True):
+        st.caption("Diese Reihenfolge hilft, damit NutzerInnen nicht raten müssen, was als Nächstes zu tun ist.")
+        st.dataframe(germanize_dataframe(workflow_df), width="stretch", hide_index=True)
+
+    with st.expander("Wie die Planung entscheidet", expanded=False):
+        st.markdown(
+            """
+            - Globale Regeln wie Überstunden, Minusstunden und Ausgleich liegen im Reiter Einstellungen.
+            - Ob ein Dienst offen bleiben darf, steuert die Priorität der Dienstform im Reiter Dienstformen & Ressourcen.
+            - Das aktuelle Optimierungsziel ist: **{optimization_mode}**.
+            - Für gleiche Eingaben wird der beste bekannte Entwurf stabil wiederverwendet.
+            """.format(
+                optimization_mode=html.escape(
+                    normalize_plan_optimization_mode(st.session_state.plan_optimization_mode)
+                )
+            )
+        )
+
+    with st.expander("Aktive Rechtsleitplanken", expanded=False):
+        st.caption("Kurzfassung als Planungsleitplanke, keine Rechtsberatung. KV, Betriebsvereinbarung und Berufsgruppe können strengere Regeln enthalten.")
+        st.dataframe(
+            germanize_dataframe(
+                legal_guardrail_dataframe(
+                    legal_profile=st.session_state.legal_profile,
+                    daily_max_work_hours=float(st.session_state.daily_max_work_hours),
+                    weekly_average_max_hours=float(st.session_state.weekly_average_max_hours),
+                    weekly_average_period_weeks=int(st.session_state.weekly_average_period_weeks),
+                    weekly_rest_hours=float(st.session_state.weekly_rest_hours),
+                    reduced_weekly_rest_hours=float(st.session_state.reduced_weekly_rest_hours),
+                    allow_reduced_weekly_rest=bool(st.session_state.allow_reduced_weekly_rest),
+                    replacement_rest_kind=st.session_state.replacement_rest_kind,
+                    replacement_rest_scope=st.session_state.replacement_rest_scope,
+                    vacation_weekend_policy=st.session_state.vacation_weekend_policy,
+                    night_credit_mode=st.session_state.night_credit_mode,
+                    night_credit_hours=float(st.session_state.night_credit_hours),
+                    time_account_usage=st.session_state.time_account_usage,
+                    pause_policy=st.session_state.pause_policy,
+                    pause_threshold_hours=float(st.session_state.pause_threshold_hours),
+                    pause_duration_minutes=int(st.session_state.pause_duration_minutes),
+                )
+            ),
+            width="stretch",
+            hide_index=True,
+        )
 
 
